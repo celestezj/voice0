@@ -8,7 +8,7 @@
 
 ## TTS 选型结论（2026-08 定案）
 
-> 完整结论见 `memory/tts-architecture-decision.md`，两者保持一致。
+> 完整选型依据（目标/硬件/候选对比/验收约定/来源）见 `docs/tts-architecture-decision.md`。
 
 **目标约束**：离线、流式（TTFA + 边合成边播）、平衡 CPU/GPU 速度与音质。
 
@@ -466,14 +466,13 @@ voice0/
 │   ├── bench_report_cuda.txt
 │   ├── smoke_cpu.wav
 │   └── smoke_cuda.wav
+├── docs/
+│   └── tts-architecture-decision.md
 ├── reports/
 │   ├── bench_timing_cpu.html
 │   └── bench_timing_cuda.html
 ├── .gitignore
 ├── README.md
-├── _bench_verify_log.txt
-├── _test_shutdown.py
-├── _test_shutdown_log.txt
 ├── bench_melo.py
 ├── preload_weights.py
 ├── synth_sapi.py
