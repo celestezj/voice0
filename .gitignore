@@ -1,5 +1,14 @@
 # 生成的音频文件（体积大，不入库）
 audio/
 
+# 生成的时序报告（交互式 HTML 等）
+reports/
+
+# HF 权重缓存 / bench 结构化数据（本项目内，不入库）
+.cache/
+
+# Python
+__pycache__/
+
 # Claude Code 本地配置（含机器相关权限，不入库）
 .claude/
