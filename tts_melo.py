@@ -20,7 +20,8 @@ v2 常驻引擎（相对 v1 的关键变化）：
   句间活动段 RMS 差实测 ~8dB，句内起伏更大（20ms 帧 p90-p10 差 17~20dB、句首/句尾明显变轻）。
   两种档位：
     - `normalize="rms"`：逐句**静态**活动段 RMS 对齐目标 -24 dBFS（治句间音量不齐）；
-    - `normalize="agc"`：静态对齐 + **句内动态压缩**（20ms 帧包络逐帧增益，治句首轻/句尾轻/中间响）。
+    - `normalize="agc"`：静态对齐 + **句内动态压缩**（20ms 帧包络逐帧增益，治句首轻/句尾轻/中间响）
+      + **短停压缩**（句内深度静音缝超 0.25s 的截短到 0.25s，治 VITS 烘焙进波形的逗号死寂收音）。
   在 `_synth` 边界生效——播放、save_wav、save_chunks_dir、speak_to_file 同时受益。
 
 典型用法（实时场景）：
@@ -484,10 +485,11 @@ class RealtimeTTS:
         return a
 
     def _normalize_audio(self, audio):
-        """归一化分发：normalize="rms"=逐句静态响度对齐（治句间）；"agc"=静态对齐后
-        再做句内动态压缩（治句内"开头轻/结尾轻/中间响"）。"""
+        """归一化分发：normalize="rms"=逐句静态响度对齐（治句间）；"agc"=静态对齐 +
+        句内动态压缩（治句内起伏）+ 短停压缩（治句内超长静音缝）。"""
         a = self._static_align(audio)
         if self._normalize == "agc":
+            a = self._pause_cap(a)
             a = self._agc(a)
         return a
 
@@ -509,10 +511,62 @@ class RealtimeTTS:
             out *= self._NORMALIZE_PEAK_CEIL / peak
         return out
 
+    def _pause_cap(self, audio, max_pause=0.25, rel_thr=1e-3):
+        """短停压缩（并进 agc）：把句内超过 max_pause 的"深度静音缝"截短到 max_pause。
+
+        背景：VITS 把标点停顿直接烘焙进单个波形，实测逗号处可生成 ~0.6s 的绝对数字
+        静音（-inf dB，远超自然短停顿 ~0.1s），听感是"每逗号之间突然消音没了声音"。
+        本方法检测帧 RMS 低于 rel_thr×peak（≈-60dB 相对峰值，只认真静音、不碰正常
+        呼吸/短停）的连续段，超过上限的从中间抽掉多余静音（两侧各留 max_pause/2 帧，
+        保留原渐入渐出边），静音接静音无咔哒；句首/句尾静音不动，保持句子自然边界。
+        """
+        a = np.asarray(audio, dtype=np.float32)
+        win = max(int(self._sr * 0.02), 1)
+        n = len(a) // win
+        if n == 0:
+            return audio
+        frames = a[:n * win].reshape(n, win)
+        rms_f = np.sqrt(np.mean(frames ** 2, axis=1))
+        peak = float(np.abs(a).max())
+        if peak <= 1e-12:
+            return audio
+        deep = rms_f < rel_thr * peak                # 深度静音帧（真静音，非呼吸）
+        max_frames = max(int(round(max_pause / 0.02)), 1)
+
+        # 收集连续深度静音段
+        runs = []
+        start = None
+        for i, d in enumerate(deep):
+            if d and start is None:
+                start = i
+            elif not d and start is not None:
+                runs.append((start, i - 1))
+                start = None
+        if start is not None:
+            runs.append((start, n - 1))
+        # 排除句首/句尾静音段（保持句子自然边界，不压缩）
+        runs = [r for r in runs if r[0] != 0 and r[1] != n - 1]
+
+        # 超长段：保留两侧 max_pause/2 帧，中间多余静音整段切除
+        cuts = []
+        for s0, s1 in runs:
+            L = s1 - s0 + 1
+            if L <= max_frames:
+                continue
+            head = max_frames // 2
+            tail = max_frames - head
+            cuts.append(((s0 + head) * win, (s1 - tail + 1) * win))
+        if not cuts:
+            return audio
+        out = a
+        for cs, ce in sorted(cuts, reverse=True):    # 从后往前切，避免索引位移
+            out = np.concatenate([out[:cs], out[ce:]])
+        return out
+
     def _agc(self, audio):
         """句内动态压缩（AGC）：按 20ms 帧 RMS 包络做逐帧增益，把句内幅度起伏压平到
         目标响度附近。帧间增益线性插值避免抽吸；噪声门防静音/呼吸被过度放大；
-        增益限幅（最多压 10dB / 抬 12dB）防过度压缩；峰值超上限整体下压。
+        增益限幅（最多压 10dB / 抬 16dB）防过度压缩；峰值超上限整体下压。
         """
         a = np.asarray(audio, dtype=np.float32)
         win = max(int(self._sr * 0.02), 1)
