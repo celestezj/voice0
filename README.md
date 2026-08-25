@@ -46,42 +46,192 @@ MeloTTS（VITS）无原生流式接口——`tts_to_file()` 整句合成完才�
 
 ---
 
-## 常驻引擎 API（v2）
+## 常驻引擎 v2（单例 · 常驻线程 · 完整生命周期）
 
-模型加载、声卡流、合成/播放线程都是**一次性**的（单例 + 常驻线程），之后任意时刻来文本都零初始化：
+> 实现：`tts_melo.py` 的 `RealtimeTTS` / `Job`。本文档是**完整设计说明**，供后续接手的 AI 快速上手——代码、语义、边界、坑全部对齐当前实现。
 
-- **单例**：任意时刻最多一个 `RealtimeTTS` 实例（重复 `RealtimeTTS(...)` 返回同一个）。
-  `device` 变更自动销毁旧实例、重建新设备；`mode` / `speed` 变更**原地切换零重载**。
-- **常驻线程**：合成线程 + 播放线程在构造时启动、`close()` 才结束，全程只创建一次。
+**背景**：实时场景下文本到达时机不可预测。v1 每次调用都"建对象 → 加载模型 → 建线程 → 用完释放"，反复初始化开销大。v2 用三根支柱解决：**单例**（模型只加载一次）、**常驻线程**（合成/播放线程只创建一次）、**代际标记 `_gen`**（新文本随时可抢占或排队）。
 
-| API | 阻塞？ | 说明 |
-|---|---|---|
-| `speak(text)` | 阻塞 | = submit + wait，播完这段才返回（bench 兼容） |
-| `submit(text)` | 非阻塞 | 入队立即返回 `Job`；**实时场景用这个** |
-| `job.wait()` | 阻塞 | 等该任务播完（或被打断取消），返回逐句时序 |
-| `interrupt()` / `stop()` | — | 打断当前正在说的 + 清空排队文本 |
-| `close()` | — | 销毁：关线程/关声卡流/清单例；幂等；`with`、`__del__`、atexit 兜底 |
-
-**两种模式**（`mode`，运行期可切）：
-- `queue`（默认）：新文本排到当前文本之后，播完再说；
-- `bargein`：新文本打断当前播放与排队（`submit` 时自动触发，等价手动 `interrupt()`）。
-
-```python
-tts = RealtimeTTS(mode="bargein")   # 常驻引擎，只创建一次
-tts.submit("第一句。")                # 非阻塞，立即返回
-tts.submit("更重要的话。")            # bargein 模式自动打断上一句
-tts.interrupt()                      # 或手动打断
-tts.close()                          # 用完了手动销毁
+```
+submit(text) → Job(gen, sentences…) ─> _jobs 队列(无界)
+     │                                      │ 合成线程（持 _synth_lock 逐句 _synth）
+     │                                      ▼
+     │                        _audio_q 队列(有界 maxsize=8, 天然背压)
+     │                                      │ 播放线程（~50ms 小块写声卡, 块间查 _gen）
+     │                                      ▼
+     │                                DONE → _finalize_job → job.mark_done
+     │                                          │
+     └────── job.wait() 阻塞于 threading.Event ◄┘ 事件 set → 唤醒 → 返回逐句时序
 ```
 
-> 注意：`del tts` 只删名字引用，单例类属性与常驻线程仍持有对象引用，**不会触发销毁**——请显式 `close()`。
+### 1. 单例机制
 
-**播放时顺手存 WAV（零额外推理）**：`submit()` / `speak()` 带 `save_wav="out.wav"` 或 `save_chunks_dir="dir/"`，复用流式合成已算好的逐句 audio 直接落盘——**不会把同一段文本再推理一遍**：
+- 类属性 `_instance` + 类锁 `_init_lock` 持有唯一活实例（`tts_melo.py`）。
+- **`__new__`**：若已有实例——传入 `device` 解析后与当前实例的 `_device` 不同 → 自动 `close()` 旧实例、清空槽位、重建新设备；否则**直接返回同一实例**，绝不二次加载模型 / 开声卡流。
+- **`__init__`**：`_inited` 为真（已是常驻实例）→ 只做运行期可变配置（`mode` / `speed`，`None` 表示"不改"），立即返回；否则做完整初始化。
+- 效果：重复 `RealtimeTTS(...)` 永远同一个对象；`mode`/`speed` 变更**原地切换零重载**；`device` 变更**销毁重建**（旧引用随之失效）。
+- **注意**：`profile` / `debug` 只在首次构造时生效，二次构造不会改变它们（只认 mode/speed）。
 
-- `save_wav`：把全部句子拼成**一个整段 WAV**；
-- `save_chunks_dir`：每句各存一份（`句01.wav`、`句02.wav`…）；
-- 两者相互独立，可同时传；任务被打断时只存已合成完的句子。
-- `speak_to_file(text, wav)` 是另一条**整段非流式**路径（自带一次推理），适合"只落盘、不播放"的场景——不要用它来补存已 `speak()` 过的文本（音频播完不保留，只能重推）。
+### 2. 常驻线程架构
+
+- `_start_workers()`：合成线程 `_worker_synth` + 播放线程 `_worker_play`，均 `daemon=True`，**构造末尾启动、`close()` 才结束**。
+- **两条队列**：
+  - `_jobs`（`queue.Queue`，**无界**）：任务级。`submit` 入队，合成线程取。
+  - `_audio_q`（`queue.Queue(maxsize=8)`，**有界**）：音频块级。有界 = 天然背压（合成远快于播放时，合成线程阻塞在 `put`，防延迟膨胀）。
+- **合成线程**逐句处理（`_run_job`）：
+  1. 每句开头检查 `self._shutdown or job.gen != self._gen` → 命中则放弃后续句子（关停/被抢占）；
+  2. `with self._synth_lock: audio = self._synth(sent)` —— **模型非线程安全，所有合成调用必须持 `_synth_lock`**（流式、预热、`speak_to_file` 共用）；
+  3. 可选落盘（见 §6）；`profile` 开时构造逐句 rec 并 `_timing_lock` 下 append 进 `job.timing`；
+  4. `q.put((gen, job, i, sent, audio, rec))` —— 元组带上 `rec` 引用，播放线程直接回填播放时间戳；
+  5. 循环走完（未 break）→ `aborted=False`；**finally** 里：发 `(gen, job, "DONE")`；若 `aborted` → 就地 `job.mark_done(canceled=True)`（兜底，防 `wait()` 悬挂）。
+- **播放线程**（`_worker_play`）：开 `sounddevice.OutputStream(sr, 1, float32, blocksize=1024)`（个别设备不支持时退回默认块）；循环取 `_audio_q`：
+  - 取到 `None` 或 `_shutdown` → 退出；
+  - 取到 `DONE`（元组第 3 元素为 `"DONE"`）→ `canceled = (gen != self._gen)`；`_finalize_job(job, canceled)` 补派生字段；`job.mark_done(canceled)`；continue；
+  - 取到音频块 → `gen != self._gen` 直接**丢弃**（被抢占的旧块）；否则 `_play_audio()` 写声卡并回填 `play_start`/`play_end`；
+  - **finally**：关停退出前清空 `_audio_q` 残留块/DONE 并就地 `mark_done` 其 Job（兜底防悬挂）；`stop`+`close` 声卡。
+- **`_play_audio`**：音频按 **~50ms 一小块**（`max(int(sr*0.05),1)`）逐块写声卡，**块间检查** `self._shutdown or gen != self._gen` → break。这是抢占粒度，残响 ~50-100ms。
+
+### 3. 两种模式（`mode`，运行期可切）
+
+- `mode` 属性只接受 `"queue"` / `"bargein"`，否则 `ValueError`；改属性立即生效。
+- **`queue`（默认）**：新文本排到当前文本之后，按序播完再说。
+- **`bargein`**：`submit()` 在 `_submit_lock` 内先 `_do_interrupt()` 再入队——新文本**自动打断**当前播放与清空旧排队（等价手动 `interrupt()` + 入队）。
+- 切换示例：`tts.mode = "bargein"`。
+
+### 4. 代际标记 `_gen` 与抢占机制
+
+- `_gen` 整型计数（初始 0），每次打断 +1；`Job` 创建时快照当前值（`job.gen`）。
+- **抢占判定**：`job.gen != self._gen` → 该任务的所有句/块一律作废。
+- **播放抢占粒度 = 50ms 块**（块间检查，立即闭嘴，残响 ~50ms）；**推理抢占粒度 = 句子边界**（正在推理的那句**合完不播**、丢弃，之后句子不再合成；且持有 `_synth_lock` 期间，bargein 新任务的合成要等这句跑完，最多等一句推理时间）。
+- **`_do_interrupt()`**：`_gen += 1` → 清空 `_jobs` 逐个 `mark_done(canceled=True)` → 清空 `_audio_q` 逐个 `mark_done(canceled=True)`。**关键坑（实测踩过）**：被清掉的音频块其 DONE 已随队列丢失，必须就地标记其 Job，否则该 `wait()` 永久悬挂。
+
+### 5. 完整生命周期
+
+- **构造**：模块 import 期重定向 `HF_HOME`/`HF_ENDPOINT`/`NLTK_DATA` 到项目内 `.cache/`（权重缓存不落系统盘）→ 加载 `TTS(language="ZH", device=...)` → 读 `_sr`(44.1k)/`_spk` → `_synth_lock` 下预热 `"你好。"`（cudnn 首次推理缓存，不计入验收）→ `_start_workers()` → `_inited=True`。
+- **使用**：`submit`（非阻塞）/ `speak`（阻塞）/ `speak_to_file`（独立非流式）/ `interrupt` / `stop`。
+- **销毁** `close()`：幂等（`_closed` 置位即返回）→ `_submit_lock` 内 `_do_interrupt()` → `_shutdown=True` → 两条队列各 `put(None)`（唤醒 worker）→ `join(timeout=10)` → `_init_lock` 下清 `_instance` 槽位。
+  - 支持 `with RealtimeTTS(...) as tts:`（`__enter__` 检查存活、`__exit__` 自动 close）；
+  - `__del__` 与模块级 `atexit.register(_atexit_close)` 兜底（进程退出自动 close）；
+  - **`del tts` 无效**：只删名字引用，单例类属性 + 常驻线程仍持有对象 → 销毁必须显式 `close()`；
+  - close 后再用任何公开方法 → `_check_alive()` 抛 `RuntimeError("RealtimeTTS 已 close()…")`；
+  - close 后可重建：下次 `RealtimeTTS(...)` 走 `_instance is None` 全新初始化。
+- **`wait()` 永不悬挂**：由 4 条 `mark_done` 路径共同保证——①正常播完（播放线程收 DONE）；②任务还在 `_jobs` 队列（`_do_interrupt` 清队列时）；③正在合成中被打断（`_run_job` finally 的 aborted 兜底）；④音频块已在 `_audio_q`（`_do_interrupt` 清音频队列时）。`close()` 在途销毁也被这些路径覆盖。
+- **Job 对象**：`wait()` 阻塞于内部 `threading.Event`，事件 set 即返回 `job.timing`；`mark_done(canceled)` = 置 `canceled` 标志 + set 事件。**被取消的任务 `timing` 可能是部分或空的**（只含已合成完的句子，且派生字段不计算）。
+
+### 6. API 参考
+
+| 方法 / 属性 | 阻塞？ | 说明 |
+|---|---|---|
+| `RealtimeTTS(device="auto", speed=None, mode=None, profile=False, debug=False)` | 构造 | 单例；device 变更销毁重建，mode/speed 原地切换，profile/debug 仅首次生效 |
+| `submit(text, save_chunks_dir=None, save_wav=None)` | 否 | 入队立即返回 `Job`；bargein 模式自动打断；**实时场景用这个** |
+| `speak(text, save_chunks_dir=None, save_wav=None)` | 是 | = `submit().wait()`，播完返回逐句时序（bench 兼容） |
+| `job.wait()` | 是 | 阻塞到本任务播完/取消，返回 `job.timing` |
+| `interrupt()` / `stop()` | 否 | 打断当前正在说的 + 清空排队文本（`stop` 是 v1 别名） |
+| `speak_to_file(text, wav_path)` | 是 | 整段**非流式**落盘 WAV（独立一次推理），"只落盘不播放"用 |
+| `close()` | 否 | 销毁（线程/声卡/单例槽位）；幂等；`with`/`__del__`/atexit 兜底 |
+| `mode` / `speed` | — | 属性，运行期可读可写（`mode` 校验取值） |
+| `device` | — | 只读 |
+| `last_ttfa` / `last_timing` | — | 最近一次 `profile` 任务（未取消）的指标快照 |
+
+**`timing` 逐句记录 schema**（每句一条 dict；**bench_melo.py 强依赖，改动必须同步 bench**）：
+
+- 合成线程写入：`idx`、`text`、`synth_start`、`synth_end`、`audio_dur`（`play_start`/`play_end` 初值 `None`）；
+- 播放线程回填：`play_start`、`play_end`；
+- DONE 收尾（**未取消**时）派生：`ttfa`（`play_start − job.t_start`）、`synth_dur`、`wait`（`play_start − synth_end`）、`interval`（句间；句1 为 `None`）；
+- **坑**：`profile=False`（默认）时 `job.timing` 为空列表（`speak()` 返回 `[]`）——要拿逐句时序必须构造时 `profile=True`。
+
+**WAV 落盘（播放时顺手存，零额外推理）**：
+- `save_wav="out.wav"`：全部句子 `np.concatenate` 拼成**一个整段 WAV**（复用流式已合成的逐句 audio，不重复推理；被打断存半截）；
+- `save_chunks_dir="dir/"`：每句各存一份（`句01.wav`、`句02.wav`…）；
+- 两者**相互独立**、可同时传；
+- `speak_to_file()` 是另一条独立非流式路径——**不要用它补存已 `speak()` 过的文本**（音频播完不保留在内存，只能重推）。
+
+### 7. 使用案例
+
+**最简阻塞**（bench 同款）：
+```python
+tts = RealtimeTTS(device="cuda", mode="queue", profile=True)
+timing = tts.speak("你好，世界。")   # 阻塞，播完返回逐句时序
+print(timing[0]["ttfa"])             # 首句 TTFA（秒）
+tts.close()
+```
+
+**实时非阻塞**（核心用法）：
+```python
+tts = RealtimeTTS(mode="queue")
+tts.submit("第一句。")                # 入队即返回，不阻塞
+tts.submit("第二句。")                # 排在第一句之后
+# ... 继续处理其他业务 ...
+tts.close()
+```
+
+**bargein 自动打断**：
+```python
+tts = RealtimeTTS(mode="bargein")
+tts.submit("这句话可能还没说完")
+tts.submit("打断它！")                # 自动打断上一句，优先播这句
+tts.close()
+```
+
+**手动打断 + 等待结果**：
+```python
+tts = RealtimeTTS(mode="queue", profile=True)
+job = tts.submit("一段很长的文本……")
+time.sleep(0.3)
+tts.interrupt()                      # 手动打断；job 被标记 canceled
+timing = job.wait()                  # 立即返回（不悬挂），timing 可能不全
+print(job.canceled)                  # True
+tts.close()
+```
+
+**运行期切换模式 / 语速**：
+```python
+tts = RealtimeTTS(mode="queue")
+tts.submit("先排队。")
+tts.mode = "bargein"                 # 原地切换，立即生效
+tts.speed = 1.2                      # 语速实时生效
+tts.submit("现在打断。")
+tts.close()
+```
+
+**播放时落盘**（零额外推理）：
+```python
+tts = RealtimeTTS()
+tts.speak("要留档的话。", save_wav="audio/full.wav", save_chunks_dir="audio/chunks/")
+tts.speak_to_file("只落盘不播放。", "audio/raw.wav")   # 独立非流式，一次推理
+tts.close()
+```
+
+**上下文管理器**（自动销毁）：
+```python
+with RealtimeTTS(mode="bargein") as tts:
+    tts.submit("离开作用域自动 close()。")
+```
+
+**device 变更自动重建**：
+```python
+tts = RealtimeTTS(device="cuda")
+tts.speak("先用 GPU。")
+RealtimeTTS(device="cpu")            # 旧实例被自动 close()，重建为 cpu 实例
+tts.speak("再调用会抛 RuntimeError")  # 旧引用已失效
+```
+
+**空文本**：
+```python
+job = tts.submit("   ")              # 无句子，立即完成
+assert job.wait() == []              # wait() 直接返回空列表
+```
+
+### 8. 线程安全与易踩的坑（给后续接手者）
+
+1. **模型非线程安全**：所有 `_synth` 必须持 `_synth_lock`（流式合成、预热、`speak_to_file` 共用同一把锁，天然串行）。
+2. **`_submit_lock` 不可重入**：`submit`/`interrupt`/`close` 用它串行化；`_do_interrupt` 是内部原语，调用方须已 `_check_alive()` + 持锁（`close` 有意跳过 alive 检查以保持幂等）——别在 `_do_interrupt` 里再拿锁。
+3. **别改回一次写整段声卡**：`_play_audio` 的 50ms 小块 + 块间查 `_gen` 是抢占的物理基础，改大残响变长。
+4. **`_audio_q` 有界 maxsize=8**：改大 → 延迟膨胀；改小 → 背压提前、合成可能被卡。
+5. **改队列结构时必须同传 Job 引用与 DONE 标记**，且中断/关停清空队列时**务必就地 `mark_done`**——否则 `wait()` 永久悬挂（本项目实测踩坑）。
+6. **`profile=False` 时拿不到时序**（timing 空）；bench 依赖的 timing schema 改动要同步 `bench_melo.py`。
+7. **单例跨进程不共享**：每个进程各一份；bench 按 device 拆子进程，正是因 MeloTTS BERT 为模块级单例，CPU/GPU 同进程会设备不匹配。
+8. **销毁只能 `close()`**：`del tts` 只删名字引用，单例槽位 + 常驻线程仍持引用，对象不会被回收。
 
 ---
 
