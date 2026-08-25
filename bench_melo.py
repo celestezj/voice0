@@ -125,9 +125,15 @@ def console_gantt(results, width=58):
             row_s = [" "] * width
             for k in range(s0, min(s1, width - 1)):
                 row_s[k] = "="
+            # 时间轴按整段跨度归一化：音频长 ≫ 合成时长时，短合成会被压缩成 0 格
+            #（整行空白，看不出合成了）。时长非零却塌缩到 0 格时，强制画至少 1 格。
+            # if s1 <= s0 and r["synth_end"] > r["synth_start"]:
+            #     row_s[min(s0, width - 1)] = "="
             row_p = [" "] * width
             for k in range(p0, min(p1, width - 1)):
                 row_p[k] = "-"
+            # if p1 <= p0 and r["audio_dur"] > 0:
+            #     row_p[min(p0, width - 1)] = "-"
             tag = "  <- 句%d TTFA=%.3fs" % (i + 1, r["ttfa"]) if i == 0 else ""
             print("  句%d合成 %s%s" % (i + 1, "".join(row_s), tag))
             print("  句%d播放 %s" % (i + 1, "".join(row_p)))
