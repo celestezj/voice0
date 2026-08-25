@@ -235,24 +235,106 @@ assert job.wait() == []              # wait() 直接返回空列表
 
 ---
 
-## 环境与运行
+## 环境与复现（新设备一键复现）
+
+> 目标：**别人只凭本文档，在一台新设备上从零得到可用的 voice0 系统**。所有版本号均为 `voice-tts` 环境实测（2026-08-25 抓取），不是估算。
+
+### 硬件与系统要求
+
+| 项 | 要求 | 说明 |
+|---|---|---|
+| 系统 | Windows / Linux 均可（本仓库在 Windows 11 实测） | — |
+| Python | **3.10**（conda 推荐） | 3.11+ 未经本仓库验证 |
+| GPU | NVIDIA + **CUDA 12.6 兼容驱动**（推荐） | 实测 RTX 2070 SUPER 8GB，**峰值显存 1.088GB**，首句 TTFA ~0.2s |
+| CPU-only | 可用，`device="cpu"` | 首句 TTFA ~1s，达标但明显慢于 GPU |
+| 磁盘 | ~5GB | torch（~2.5GB）+ 权重缓存 `.cache/hf`（~0.9GB）+ NLTK 语料 |
+| 网络 | **首次**下载权重需联网 | huggingface.co 被墙时脚本自动走 `hf-mirror.com` 镜像；**之后运行期零网络** |
+| ffmpeg | 可选 | 仅 MP3 转码用；不装只产 WAV |
+
+### 已锁定版本（复现基准，实测值）
+
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| python | 3.10.16 | conda |
+| torch | 2.11.0+cu126 | cu126 = CUDA 12.6 版，PyPI 专属 index（见下） |
+| torchaudio | 2.11.0+cu126 | 与 torch 配套 |
+| melotts | **0.1.2**（源码 editable 装，见步骤 3） | PyPI 版为 0.1.1；实测用源码 0.1.2 |
+| sounddevice | 0.5.6 | 声卡流（**必须显式安装**，非 melotts 依赖） |
+| numpy | 2.2.6 | 勿降级 |
+| transformers | 4.57.6 | — |
+| huggingface_hub | 0.36.2 | — |
+| jieba | 0.42.1 | 中文分词（ZH 必需） |
+| nltk | 3.10.3 | 英文音素前端语料 |
+| scipy / numba / librosa / pypinyin | 1.15.3 / 0.67.0 / 0.11.0 / 0.55.0 | melotts 推理链路依赖 |
+| setuptools | **80.9.0（固定）** | 81+ 移除 `pkg_resources`，**jieba 会崩**（见坑 ①） |
+
+### 从零复现步骤（新设备推荐，可整段复制）
 
 ```bash
-# 1. 克隆虚拟环境（不污染 yolo-gpu 的 python3.10）
-conda create -n voice-tts --clone python3.10
-D:/anaconda/envs/voice-tts/python.exe -m pip install melotts sounddevice
+# 0. 前提：已安装 conda（miniconda 即可）、git
 
-# 2. 首次运行预下载全部权重（huggingface.co 在本机被墙，脚本自动走 hf-mirror 镜像；一次性联网）
-D:/anaconda/envs/voice-tts/python.exe preload_weights.py
+# 1. 建环境（Python 3.10）
+conda create -n voice-tts python=3.10 -y
+conda activate voice-tts
 
-# 3. 验收（CPU/GPU 各一轮，含时序图与 README 自动更新）
-D:/anaconda/envs/voice-tts/python.exe bench_melo.py --device all --profile --debug
+# 2. torch（CUDA 12.6 版；无 GPU 就装 CPU 版：pip install torch==2.11.0 torchaudio==2.11.0）
+pip install torch==2.11.0+cu126 torchaudio==2.11.0+cu126 \
+    --index-url https://download.pytorch.org/whl/cu126
 
-# 裸管线（无插桩，贴近生产）
-D:/anaconda/envs/voice-tts/python.exe bench_melo.py --device cuda
+# 3. melotts（方式A=精确对齐实测 0.1.2 源码；方式B=PyPI 0.1.1 更省事）
+#    方式A（推荐，与实测完全一致；github 被墙时加前缀 https://ghfast.top/）
+git clone https://github.com/myshell-ai/MeloTTS.git .cache/MeloTTS
+pip install -e .cache/MeloTTS
+#    方式B：pip install melotts          # PyPI 0.1.1，功能等价
+pip install sounddevice==0.5.6           # 声卡流，必装
+
+# 4. 锁关键依赖版本（melotts 会自带 jieba/g2p-en 等，这里显式对齐实测）
+pip install numpy==2.2.6 transformers==4.57.6 huggingface_hub==0.36.2 \
+            jieba==0.42.1 nltk==3.10.3 scipy==1.15.3 numba==0.67.0 \
+            librosa==0.11.0 pypinyin==0.55.0
+pip install setuptools==80.9.0           # jieba 依赖 pkg_resources，必须 <81
+
+# 5. 一次性预下载全部权重（6 个 tokenizer + 670MB BERT + ZH VITS + NLTK 语料）
+#    自动重建 .cache/hf 与 .cache/nltk_data（本项目内，不入库）
+python preload_weights.py
+
+# 6. 验收：CPU/GPU 各一轮，自动产出时序报告并更新本 README 的验收区间
+python bench_melo.py --device all --profile --debug
+
+# 裸管线（无插桩，贴近生产）：
+python bench_melo.py --device cuda
 ```
 
-产出：`audio/2_melo_{device}_{case}.wav`（试听对比）、`reports/bench_timing_{device}.html`（悬停看明细）、`audio/bench_report_{device}.txt`。MP3 压缩依赖 ffmpeg（本机未装，仅产出 WAV）；装了 ffmpeg 后自动追加 `.mp3`。
+**预期结果对照**（应达到的 TTFA，单位秒）：
+
+| 设备 | 短句 | 中句 | 长句 | 判定 |
+|---|---|---|---|---|
+| GPU (cuda) | ~0.20 | ~0.16 | ~0.36 | 全部 <1s ✅ |
+| CPU | ~0.93 | ~1.00 | ~2.6 | 短/中 <1s ✅，长句 CPU 略超属正常（合成是瓶颈） |
+
+### 原有克隆路径（仅原机器场景：目标机已有含 torch 的 python3.10 大环境）
+
+```bash
+conda create -n voice-tts --clone python3.10   # 复制含 torch 2.11.0+cu126 的环境
+D:/anaconda/envs/voice-tts/python.exe -m pip install melotts sounddevice
+D:/anaconda/envs/voice-tts/python.exe preload_weights.py
+D:/anaconda/envs/voice-tts/python.exe bench_melo.py --device all --profile --debug
+```
+
+> 从大环境克隆才会遇到坑 ②（jax 冲突）；从零 `conda create python=3.10` 不会。
+
+### 常见坑（复现时）
+
+1. **setuptools ≥ 81 会让 jieba 崩**（`pkg_resources` 被移除）→ 必须 `pip install setuptools==80.9.0`。
+2. **克隆大环境带的 jax/jaxlib/ml_dtypes 与 numpy 2.2.6 不兼容**，会在 import transformers 时崩 → 卸载 `pip uninstall -y jax jaxlib ml_dtypes`（仅克隆路径需处理）。
+3. **huggingface.co / raw.githubusercontent 在本机被墙/极慢** → 脚本已内置 `HF_ENDPOINT=hf-mirror.com` 与 `ghfast.top` 代理，首次下载自动走镜像。
+4. **权重缓存必须落在项目内**：`tts_melo.py` / `preload_weights.py` 在 import 期就把 `HF_HOME`/`NLTK_DATA` 重定向到 `.cache/`，不要手动改。
+5. **换设备 `.cache/` 不会随 git 过来**（已 gitignore）——重装环境后跑一次 `preload_weights.py` 即可自动重建，无需手动拷贝。
+6. **`import melo` 用的是 editable 源码**（`.cache/MeloTTS`）：删掉该目录会导致 import 失败，需要重跑步骤 3 方式A。
+
+### 产出说明
+
+`audio/2_melo_{device}_{case}.wav`（试听对比）、`reports/bench_timing_{device}.html`（悬停看明细）、`audio/bench_report_{device}.txt`。MP3 压缩依赖 ffmpeg（本机未装，仅产出 WAV）；装了 ffmpeg 后自动追加 `.mp3`。
 
 ---
 
