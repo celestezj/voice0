@@ -235,7 +235,64 @@ assert job.wait() == []              # wait() 直接返回空列表
 
 ---
 
-## 环境与复现（新设备一键复现）
+## 多方案扩展与目录演进（未来路线）
+
+> 当前**保持平铺结构**（4 个顶层 `.py`，规模小）。本节记录"未来接入新 TTS 方案"的**已验证思考**，后续接手者直接按此演进，不必重新论证。
+
+### 现状：为什么 sapi 与 melo 平铺共存
+
+- `synth_sapi.py` 是**非神经对照基线**（Windows SAPI / pyttsx3，一次性落盘），与神经链路**零代码耦合**——唯一联系是 `audio/1_sapi_huihui.wav` 并排试听约定 + 目录树。
+- melo 栈三件套（`tts_melo.py` / `bench_melo.py` / `preload_weights.py`）自洽：bench 只 `import tts_melo`，preload 独立。
+- 规模小 → 暂不拆目录（避免 YAGNI 与"为改结构而改"的回归风险）。
+
+### 已验证：v2 引擎的可复用边界
+
+v2 引擎（`RealtimeTTS`）本质是**后端无关骨架 + 一处后端专属**：
+
+| 后端无关（换方案可原样复用） | 后端专属（须替换） |
+|---|---|
+| `Job`（wait / mark_done / canceled / timing） | **`_synth(text) -> 整句数组`**（Melo 无原生流式，一次性合成整句） |
+| 常驻合成/播放双线程、`_jobs` + `_audio_q`（背压） | timing 口径微调（见下） |
+| `_gen` 代际抢占、queue/bargein 模式、interrupt/close 生命周期 | |
+| timing schema、save_wav / save_chunks_dir、profile/debug | |
+
+### 原生流式后端（MOSS-TTS-Nano / CosyVoice2）的适配点
+
+原生流式 = 模型**边生成边吐音频块**，不必等整句合成完。适配集中在合成边界一层：
+
+```python
+# Melo（现状）：整句一次性
+audio = self._synth(sent)
+q.put((gen, job, i, sent, audio, rec))          # 整句入队
+
+# 原生流式（改后）：逐块吐出
+for chunk in self._synth_stream(sent):          # 生成器，边推理边产出
+    q.put((gen, job, i, sent, chunk, rec))      # 逐块入队，播放线程原样消费
+```
+
+- **播放线程零改动**（本就能消费任意长度块）；抢占粒度从"句子边界"→"块边界"，**更细、残响更短**；
+- timing 口径微调：`ttfa` 变为"首块到播放时刻"；`wait` / `interval` 按句聚合口径需重算；
+- **换后端 ≈ 重写合成边界一层，不是从零重建**（骨架复用约 80%）。
+
+### 目录演进（分两阶段，避免过早重构）
+
+- **阶段 1（现状，不拆）**：melo 平铺；sapi 暂留根目录。若将来要挪 sapi，唯一代码改动是 `synth_sapi.py` 的 `OUTPUT_DIR`——现用 `__file__` 相对定位，挪进子目录会写错路径（变成 `sapi/audio/`），须改为项目根向上取一级。
+- **阶段 2（引入第二个流式后端并验证跑通后，一次到位）**：抽后端无关骨架到 `tts/core/`，各后端子目录：
+
+```
+voice0/
+├── tts/
+│   ├── core/          # 后端无关骨架：Job/workers/gen/modes/lifecycle（自 tts_melo.py 抽出）
+│   ├── melo/          # Melo 后端：_synth + preload（薄壳）
+│   ├── moss/          # （未来）MOSS-TTS-Nano：_synth_stream
+│   └── cosy/          # （未来）CosyVoice2：_synth_stream
+├── sapi/              # 非神经对照基线
+├── bench/             # 各后端验收脚本
+├── docs/
+└── README.md
+```
+
+> 阶段 2 的触发条件 = **确实引入第二个流式后端**。在此之前不拆 `tts/core`，避免为"未来可能"动正在工作的引擎。
 
 > 目标：**别人只凭本文档，在一台新设备上从零得到可用的 voice0 系统**。所有版本号均为 `voice-tts` 环境实测（2026-08-25 抓取），不是估算。
 
