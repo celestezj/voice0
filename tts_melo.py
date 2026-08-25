@@ -16,6 +16,12 @@ v2 常驻引擎（相对 v1 的关键变化）：
 - **`close()`**：销毁——打断剩余任务、关停常驻线程、关闭声卡流、清空单例槽位。
   支持 `with RealtimeTTS(...) as tts:`；`__del__` 与进程退出（atexit）兜底。
 - 插桩仍全走开关：profile（时序分析）/ debug（详细日志），生产关闭时热路径零计时埋点。
+- **逐句响度归一化**（`normalize`，默认关闭）：MeloTTS 逐句独立合成、不做响度均衡——
+  句间活动段 RMS 差实测 ~8dB，句内起伏更大（20ms 帧 p90-p10 差 17~20dB、句首/句尾明显变轻）。
+  两种档位：
+    - `normalize="rms"`：逐句**静态**活动段 RMS 对齐目标 -24 dBFS（治句间音量不齐）；
+    - `normalize="agc"`：静态对齐 + **句内动态压缩**（20ms 帧包络逐帧增益，治句首轻/句尾轻/中间响）。
+  在 `_synth` 边界生效——播放、save_wav、save_chunks_dir、speak_to_file 同时受益。
 
 典型用法（实时场景）：
     tts = RealtimeTTS(mode="bargein")   # 常驻引擎，只创建一次
@@ -106,10 +112,14 @@ class Job:
 class RealtimeTTS:
     _instance = None            # 单例槽位
     _init_lock = threading.Lock()
+    # 逐句响度归一化（normalize="rms"）常量：
+    # 目标 = 活动段(非静音) RMS -24 dBFS（≈0.0631）；峰值上限 0.95，超则整体下压防爆音。
+    _NORMALIZE_TARGET = 10 ** (-24.0 / 20.0)
+    _NORMALIZE_PEAK_CEIL = 0.95
 
     # 单例：任何时刻最多一个活实例。device 变更 → 销毁旧实例重建；
     # 其余配置（mode/speed）变更 → 原地切换。
-    def __new__(cls, device="auto", speed=None, mode=None, profile=False, debug=False):
+    def __new__(cls, device="auto", speed=None, mode=None, normalize=None, profile=False, debug=False):
         with cls._init_lock:
             inst = cls._instance
             if inst is not None:
@@ -123,18 +133,21 @@ class RealtimeTTS:
             cls._instance = obj
             return obj
 
-    def __init__(self, device="auto", speed=None, mode=None, profile=False, debug=False):
-        # 已是常驻实例：只做运行期可变的配置（mode/speed），None 表示"不改"。
+    def __init__(self, device="auto", speed=None, mode=None, normalize=None, profile=False, debug=False):
+        # 已是常驻实例：只做运行期可变的配置（mode/speed/normalize），None 表示"不改"。
         if getattr(self, "_inited", False):
             if mode is not None:
                 self.mode = mode
             if speed is not None:
                 self.speed = float(speed)
+            if normalize is not None:
+                self.normalize = normalize
             return
 
         self._device = _resolve_device(device)
         self._speed = 1.0 if speed is None else float(speed)
         self.mode = "queue" if mode is None else mode
+        self.normalize = normalize          # None=不处理；"rms"=逐句 RMS 响度均衡
         self._profile = profile
         self._debug = debug
         self._closed = False
@@ -196,6 +209,16 @@ class RealtimeTTS:
         if v not in ("queue", "bargein"):
             raise ValueError("mode 只支持 'queue'/'bargein'，收到: %r" % v)
         self._mode = v
+
+    @property
+    def normalize(self):
+        return self._normalize
+
+    @normalize.setter
+    def normalize(self, v):
+        if v is not None and v not in ("rms", "agc"):
+            raise ValueError("normalize 只支持 None/'rms'/'agc'，收到: %r" % v)
+        self._normalize = v
 
     # ---------------- debug 辅助 ----------------
     def _env_banner(self):
@@ -450,9 +473,87 @@ class RealtimeTTS:
         return sentences
 
     def _synth(self, text):
-        """整句合成，返回 44.1kHz float32 numpy 数组（[-1,1]）。调用方须持有 _synth_lock。"""
-        return self._model.tts_to_file(
+        """整句合成，返回 44.1kHz float32 numpy 数组（[-1,1]）。调用方须持有 _synth_lock。
+
+        归一化开关在此生效：播放、save_wav、save_chunks_dir、speak_to_file 全部走这里。
+        """
+        a = self._model.tts_to_file(
             text, self._spk, output_path=None, speed=self._speed, quiet=True)
+        if self._normalize:
+            a = self._normalize_audio(a)
+        return a
+
+    def _normalize_audio(self, audio):
+        """归一化分发：normalize="rms"=逐句静态响度对齐（治句间）；"agc"=静态对齐后
+        再做句内动态压缩（治句内"开头轻/结尾轻/中间响"）。"""
+        a = self._static_align(audio)
+        if self._normalize == "agc":
+            a = self._agc(a)
+        return a
+
+    def _static_align(self, audio):
+        """逐句静态响度对齐：按"活动段(非静音) RMS"缩放整句，对齐目标响度。
+
+        不用整句 RMS 的原因：VITS 句首句尾常带静音，静音占比句间差异大（实测
+        37%~64%），会稀释整句 RMS——静音多的句子被过度放大、少的被压小，语音段
+        实际响度仍不齐。只按有语音的帧算 RMS 对齐，才接近人耳感知的语音响度。
+        峰值超上限则整体下压防爆音；全静音句跳过。
+        """
+        a = np.asarray(audio, dtype=np.float32)
+        rms_act = self._active_rms(a)
+        if rms_act <= 1e-6:
+            return audio                        # 无活动帧：跳过，避免除零/放大噪声
+        out = a * (self._NORMALIZE_TARGET / rms_act)
+        peak = float(np.abs(out).max())
+        if peak > self._NORMALIZE_PEAK_CEIL:
+            out *= self._NORMALIZE_PEAK_CEIL / peak
+        return out
+
+    def _agc(self, audio):
+        """句内动态压缩（AGC）：按 20ms 帧 RMS 包络做逐帧增益，把句内幅度起伏压平到
+        目标响度附近。帧间增益线性插值避免抽吸；噪声门防静音/呼吸被过度放大；
+        增益限幅（最多压 10dB / 抬 12dB）防过度压缩；峰值超上限整体下压。
+        """
+        a = np.asarray(audio, dtype=np.float32)
+        win = max(int(self._sr * 0.02), 1)
+        n = len(a) // win
+        if n == 0:
+            return audio
+        frames = a[:n * win].reshape(n, win)
+        rms_f = np.sqrt(np.mean(frames ** 2, axis=1))
+        gate = max(float(rms_f.max()) * 1e-3, 1e-6)   # 噪声门限（相对本句峰值 RMS）
+        env = np.maximum(rms_f, gate)
+        gain_db = 20.0 * np.log10(self._NORMALIZE_TARGET / env)
+        gain_db = np.clip(gain_db, -10.0, 16.0)   # 最多压 10dB / 抬 16dB
+        gain = 10.0 ** (gain_db / 20.0)
+        centers = win // 2 + np.arange(n) * win
+        out = a[:n * win] * np.interp(np.arange(n * win), centers, gain)
+        if n * win < len(a):
+            out = np.concatenate([out, a[n * win:] * float(gain[-1])])
+        peak = float(np.abs(out).max())
+        if peak > self._NORMALIZE_PEAK_CEIL:
+            out *= self._NORMALIZE_PEAK_CEIL / peak
+        return out
+
+    def _active_rms(self, audio, win_s=0.02, rel_thr=0.02):
+        """按 20ms 帧统计非静音帧的 RMS（能量均值），静音帧不参与。
+
+        关键：活动阈值取**相对句子峰值**的比例（thr = rel_thr × peak），
+        缩放前后峰值等比变化 → 活动帧集合对增益不变，归一化后活动 RMS 精确等于目标
+        （若用固定阈值，放大/缩小后贴边帧会跨入/跨出活动集，测得值偏离目标）。
+        """
+        a = np.asarray(audio, dtype=np.float32)
+        win = max(int(self._sr * win_s), 1)
+        n = len(a) // win
+        if n == 0:
+            return 0.0
+        frames = a[:n * win].reshape(n, win)
+        rms_f = np.sqrt(np.mean(frames ** 2, axis=1))
+        peak = float(np.abs(a).max())
+        act = rms_f[rms_f > rel_thr * peak]
+        if len(act) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(act ** 2)))
 
     # ---------------- 生命周期 ----------------
     def _shutdown_engine(self):

@@ -70,7 +70,7 @@ submit(text) → Job(gen, sentences…) ─> _jobs 队列(无界)
 - **`__new__`**：若已有实例——传入 `device` 解析后与当前实例的 `_device` 不同 → 自动 `close()` 旧实例、清空槽位、重建新设备；否则**直接返回同一实例**，绝不二次加载模型 / 开声卡流。
 - **`__init__`**：`_inited` 为真（已是常驻实例）→ 只做运行期可变配置（`mode` / `speed`，`None` 表示"不改"），立即返回；否则做完整初始化。
 - 效果：重复 `RealtimeTTS(...)` 永远同一个对象；`mode`/`speed` 变更**原地切换零重载**；`device` 变更**销毁重建**（旧引用随之失效）。
-- **注意**：`profile` / `debug` 只在首次构造时生效，二次构造不会改变它们（只认 mode/speed）。
+- **注意**：`profile` / `debug` 只在首次构造时生效，二次构造不会改变它们（只认 mode/speed/normalize）。
 
 ### 2. 常驻线程架构
 
@@ -122,14 +122,14 @@ submit(text) → Job(gen, sentences…) ─> _jobs 队列(无界)
 
 | 方法 / 属性 | 阻塞？ | 说明 |
 |---|---|---|
-| `RealtimeTTS(device="auto", speed=None, mode=None, profile=False, debug=False)` | 构造 | 单例；device 变更销毁重建，mode/speed 原地切换，profile/debug 仅首次生效 |
+| `RealtimeTTS(device="auto", speed=None, mode=None, normalize=None, profile=False, debug=False)` | 构造 | 单例；device 变更销毁重建，mode/speed/normalize 原地切换，profile/debug 仅首次生效 |
 | `submit(text, save_chunks_dir=None, save_wav=None)` | 否 | 入队立即返回 `Job`；bargein 模式自动打断；**实时场景用这个** |
 | `speak(text, save_chunks_dir=None, save_wav=None)` | 是 | = `submit().wait()`，播完返回逐句时序（bench 兼容） |
 | `job.wait()` | 是 | 阻塞到本任务播完/取消，返回 `job.timing` |
 | `interrupt()` / `stop()` | 否 | 打断当前正在说的 + 清空排队文本（`stop` 是 v1 别名） |
 | `speak_to_file(text, wav_path)` | 是 | 整段**非流式**落盘 WAV（独立一次推理），"只落盘不播放"用 |
 | `close()` | 否 | 销毁（线程/声卡/单例槽位）；幂等；`with`/`__del__`/atexit 兜底 |
-| `mode` / `speed` | — | 属性，运行期可读可写（`mode` 校验取值） |
+| `mode` / `speed` / `normalize` | — | 属性，运行期可读可写（`mode`/`normalize` 校验取值） |
 | `device` | — | 只读 |
 | `last_ttfa` / `last_timing` | — | 最近一次 `profile` 任务（未取消）的指标快照 |
 
@@ -145,6 +145,15 @@ submit(text) → Job(gen, sentences…) ─> _jobs 队列(无界)
 - `save_chunks_dir="dir/"`：每句各存一份（`句01.wav`、`句02.wav`…）；
 - 两者**相互独立**、可同时传；
 - `speak_to_file()` 是另一条独立非流式路径——**不要用它补存已 `speak()` 过的文本**（音频播完不保留在内存，只能重推）。
+
+**逐句响度归一化（`normalize` 开关）**：
+- **为什么需要**：MeloTTS 逐句独立合成、不做响度均衡。实测两类不齐：
+  - **句间**：活动段（非静音）RMS 差 ~8dB，短句/唱词类句子明显偏小；
+  - **句内**：20ms 帧语音 RMS 的 p90−p10 差达 **17~20dB**、最大起伏 ~26dB，且模式稳定——**句首 ~100ms 从约 -40dB 爬升、句尾 200~300ms 回落到 -40dB**（开头轻 / 结尾轻 / 中间响，VITS 幅度包络特性）。
+- `normalize=None`（默认）：原样播放，不做任何增益；
+- `normalize="rms"`：**静态**逐句响度对齐——按 20ms 帧剔除非静音帧算活动段 RMS（活动阈值取**相对句子峰值的比例**，缩放不变，对齐精确），整句缩放对齐目标 **-24 dBFS**，峰值超 **0.95** 整体下压（全静音句跳过）。治**句间**音量不齐，句内起伏不变；
+- `normalize="agc"`：在 rms 静态对齐基础上再加**句内动态压缩**——按 20ms 帧 RMS 包络做逐帧增益压平到目标响度附近（帧间增益线性插值防抽吸、噪声门防静音/呼吸被抬、增益限幅 -10~+12dB），治**句首轻/句尾轻/中间响**。全句音量最一致（推荐）；
+- 均在 `_synth` 边界生效——播放、`save_wav`、`save_chunks_dir`、`speak_to_file` 同时受益；运行期可切：`tts.normalize = "rms"` / `"agc"` / `None`（原地生效）。
 
 ### 7. 使用案例
 
@@ -199,6 +208,15 @@ tts.close()
 tts = RealtimeTTS()
 tts.speak("要留档的话。", save_wav="audio/full.wav", save_chunks_dir="audio/chunks/")
 tts.speak_to_file("只落盘不播放。", "audio/raw.wav")   # 独立非流式，一次推理
+tts.close()
+```
+
+**逐句响度归一化**（音量一致）：
+```python
+tts = RealtimeTTS(normalize="agc")     # 或运行期 tts.normalize = "agc"
+tts.speak("短句会小声。")              # agc：句间+句内音量都压平（推荐）
+tts.normalize = "rms"                  # 只做句间静态对齐，句内起伏保留
+tts.normalize = None                   # 随时切回原样
 tts.close()
 ```
 

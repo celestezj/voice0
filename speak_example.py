@@ -48,10 +48,16 @@ def main():
         (2, "cpu", "cpu"),
         (3, "cuda", "cuda"),
     ], "auto")
+    normalize = _prompt_choice("响度归一化", [
+        (1, None, "不归一化 （默认）原样播放，音量起伏由模型决定"),
+        (2, "rms", "rms 逐句静态响度对齐（句间更一致）"),
+        (3, "agc", "agc 句内动态压缩 + 句间对齐，全句音量最一致（推荐）"),
+    ], None)
 
     print("\n正在加载 MeloTTS（模型加载 + 预热，首次约 10-30s）...")
-    tts = RealtimeTTS(device=device, mode=mode, profile=True)
-    print("就绪！当前 mode=%s device=%s" % (tts.mode, tts.device))
+    tts = RealtimeTTS(device=device, mode=mode, normalize=normalize, profile=True)
+    print("就绪！当前 mode=%s device=%s normalize=%s"
+          % (tts.mode, tts.device, tts.normalize))
     print("输入一段文本回车即播报；输入 exit 退出。\n")
 
     seq = 0
