@@ -96,7 +96,7 @@ python bench/bench_cosy.py --device cuda --profile
 ```python
 from tts import RealtimeTTS
 tts = RealtimeTTS(device="cuda", backend="cosy",
-                  voice="clone:E:/data/voice.wav:我的声音转写文本")
+                  voice="clone:<参考wav的绝对路径>:我的声音转写文本")
 tts.speak_to_file("用我的声音说这句话。", "audio/mine.wav")
 tts.close()
 ```
@@ -128,8 +128,8 @@ tts.close()
 
 ```python
 # -*- coding: utf-8 -*-
-"""CosyVoice2 后端完整使用案例。用 voice-tts 环境跑：
-   D:/anaconda/envs/voice-tts/python.exe examples/cosy_demo.py   # 或直接整段贴进脚本
+"""CosyVoice2 后端完整使用案例。先 conda activate voice-tts，再：
+   python examples/cosy_demo.py   # 或直接整段贴进脚本
 """
 from tts import RealtimeTTS
 
@@ -139,7 +139,7 @@ with RealtimeTTS(device="cuda", backend="cosy", voice="default") as tts:
 
 # 2) 3s 音色克隆 → voice = "clone:<参考wav>:<该音频的转写文本>"
 with RealtimeTTS(device="cuda", backend="cosy",
-                 voice="clone:E:/data/voice.wav:我的声音转写文本") as tts:
+                 voice="clone:<参考wav的绝对路径>:我的声音转写文本") as tts:
     tts.speak_to_file("用我的声音说这句话。", "audio/cosy_mine.wav")
 
 # 3) 实时播放：submit 非阻塞入队 / speak 阻塞播完（每句整句合成后播放，句内无缝）
@@ -275,7 +275,7 @@ python bench/bench_cosy.py --clone-wav X.wav --clone-text X # 用自己的 3s �
 
 ## 10. Windows 坑速查
 
-1. **Python 必须是 `voice-tts` 环境**（`D:/anaconda/envs/voice-tts/python.exe`），base 无 torch。
+1. **Python 必须是 `voice-tts` 环境**（先 `conda activate voice-tts`，再统一用 `python`），base 无 torch。
 2. **torchaudio 2.x 不能用 `backend='soundfile'`**：会强制 torchcodec → patch ③。
 3. **onnxruntime provider**：CPU 版没有 CUDA provider，frontend 按 `torch.cuda.is_available()` 请求会崩 → `_force_cpu_onnx()`。
 4. **wetext modelscope 限流 403**：第二次加载会降级无文本前端 → `_ensure_wetext_local()`。

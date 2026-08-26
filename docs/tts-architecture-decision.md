@@ -11,7 +11,7 @@
 ## 硬件与开发环境
 
 - GPU：**RTX 2070 SUPER 8GB**（Turing sm_75），NVIDIA 驱动 591.86 / CUDA 13.1，总显存 8.59GB。
-- conda 环境 `voice-tts`（D:\anaconda\envs\voice-tts，**克隆自 python3.10**，含 torch 2.11.0+cu126）——本项目专用；克隆是为了不污染 yolo-gpu 正在用的 python3.10。
+- conda 环境 `voice-tts`（**开发机**位于 D:\anaconda\envs\voice-tts，**克隆自 python3.10**，含 torch 2.11.0+cu126）——本项目专用；克隆是为了不污染 yolo-gpu 正在用的 python3.10。其他设备不依赖此路径，按 README 从零复现同名环境即可。注：项目建立伊始，在创建虚拟环境时建议AI直接拷贝了已有的深度学习项目（yolo）的环境
 - **新设备从零复现以 README「环境与复现（新设备一键复现）」为准**（含实测锁定版本表、conda 步骤、常见坑）。
 - 本机网络：huggingface.co / raw.githubusercontent.com 直连被墙或极慢；**hf-mirror.com 与 ghfast.top 代理可用**（仅首次下载权重用）。
 - 环境修正（仅克隆大环境路径会遇到）：卸载克隆自带的 jax/jaxlib/ml_dtypes（与 numpy 2.2.6 不兼容，会崩 transformers）；setuptools 固定 80.9.0（81+ 移除 pkg_resources，jieba 需要）。

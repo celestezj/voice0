@@ -395,13 +395,14 @@ python bench/bench_melo.py --device cuda
 | GPU (cuda) | ~0.20 | ~0.16 | ~0.36 | 全部 <1s ✅ |
 | CPU | ~0.93 | ~1.00 | ~2.6 | 短/中 <1s ✅，长句 CPU 略超属正常（合成是瓶颈） |
 
-### 原有克隆路径（仅原机器场景：目标机已有含 torch 的 python3.10 大环境）
+### 原有克隆路径（目标机已有含 torch 的 python3.10 大环境时）
 
 ```bash
 conda create -n voice-tts --clone python3.10   # 复制含 torch 2.11.0+cu126 的环境
-D:/anaconda/envs/voice-tts/python.exe -m pip install melotts sounddevice
-D:/anaconda/envs/voice-tts/python.exe preload_weights.py
-D:/anaconda/envs/voice-tts/python.exe bench/bench_melo.py --device all --profile --debug
+conda activate voice-tts                       # 之后统一用 python，无需绝对路径
+python -m pip install melotts sounddevice
+python preload_weights.py
+python bench/bench_melo.py --device all --profile --debug
 ```
 
 > 从大环境克隆才会遇到坑 ②（jax 冲突）；从零 `conda create python=3.10` 不会。
@@ -520,7 +521,7 @@ array([-0.0012, -0.0008, 0.0031, ..., 0.0005], dtype=float32)
 ```python
 tts = RealtimeTTS(device="cuda", backend="cosy", voice="default")        # 默认音色（内置参考）
 tts = RealtimeTTS(device="cuda", backend="cosy",
-                  voice="clone:E:/my_voice.wav:这是我的转写文本")          # 3s 克隆
+                  voice="clone:<参考wav的绝对路径>:这是我的转写文本")      # 3s 克隆
 tts = RealtimeTTS(device="cuda", backend="cosy", max_speech_ratio=8)     # 收紧生成上限
 tts = RealtimeTTS(device="cuda", backend="cosy", stream=True)            # 恢复原生 token 级流式（首包快但本机会卡顿）
 tts.speak_to_file("要生成的文本。", "audio/cosy_out.wav")                 # 文件生成（cosy 主用途）
