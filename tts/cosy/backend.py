@@ -21,6 +21,7 @@ FunAudioLLM/CosyVoice2-0.5B 落到 .cache/hf（snapshot_download 复用缓存）
 的产物，pin 4.51.3 后生成有界、时长与文本长度成比例（约 5~7 token/字）。
 保留正常的采样随机性（±1.5×）。`max_speech_ratio` 降级为可选安全阀。
 """
+import hashlib
 import os
 import sys
 
@@ -214,7 +215,15 @@ class CosyBackend(TTSBackend):
             wav, _, text = rest.rpartition(":")
             if not os.path.exists(wav) or not text.strip():
                 raise ValueError('voice="clone:<参考wav>:<转写文本>"，参考音频须存在且文本非空，收到: %r' % v)
-            self._spk_id = ""
+            # clone 也走 add_zero_shot_spk 缓存（同 default）：参考音频的
+            # speech_feat/speech_token/说话人嵌入只编码一次，之后每句复用——
+            # 实测 clone 每句比 default 多 ~0.5s 正是这段重复编码（RTF 高 ~0.1-0.15）。
+            # 转写文本先 normalize 再缓存，与旧实时路径的 prompt token 保持一致。
+            norm = self._model.frontend.text_normalize(
+                text.strip(), split=False, text_frontend=self._text_frontend)
+            self._spk_id = "clone_" + hashlib.md5(
+                (wav + "\0" + norm).encode("utf-8")).hexdigest()[:12]
+            self._model.add_zero_shot_spk(norm, wav, self._spk_id)
             self._prompt_wav, self._prompt_text = wav, text.strip()
         else:
             raise ValueError('voice 只支持 "default" 或 "clone:<wav>:<文本>"，收到: %r' % v)
@@ -225,14 +234,13 @@ class CosyBackend(TTSBackend):
     # ---------------- 合成 ----------------
     def _gen(self, text, *, speed=1.0):
         m = self._model
-        if self._spk_id:
-            gen = m.inference_zero_shot(text, "", "",
-                                        zero_shot_spk_id=self._spk_id, stream=self._stream,
-                                        speed=speed, text_frontend=self._text_frontend)
-        else:
-            gen = m.inference_zero_shot(text, self._prompt_text, self._prompt_wav,
-                                        stream=self._stream, speed=speed,
-                                        text_frontend=self._text_frontend)
+        if not self._spk_id:
+            raise RuntimeError("cosy 音色未初始化：_setup_voice 未给出 spk_id")
+        # default 与 clone 统一走缓存 speaker 路径：参考音频编码已在 load 时做一次，
+        # 之后每句只 prefill 目标文本 + 解码，不再重复编码参考音频。
+        gen = m.inference_zero_shot(text, "", "",
+                                    zero_shot_spk_id=self._spk_id, stream=self._stream,
+                                    speed=speed, text_frontend=self._text_frontend)
         for j in gen:
             yield j["tts_speech"].detach().cpu().numpy().reshape(-1).astype(np.float32)
 
