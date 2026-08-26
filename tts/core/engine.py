@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""MeloTTS 离线实时中文 TTS 核心模块（v2：常驻引擎）。
+"""离线实时中文 TTS 核心模块（v2：常驻引擎，多后端）。
 
-架构：句子级分块 + 生产者-消费者流式（"模拟"流式，因 MeloTTS/VITS 无原生流式接口）。
+架构：句子级分块 + 生产者-消费者流式（流式能力由后端提供：melo=整句一块、
+cosy=原生逐块）。本模块零后端 import，后端经 tts.core.backend.get_backend 惰性加载。
 
 v2 常驻引擎（相对 v1 的关键变化）：
 - **单例**：任意时刻最多一个 RealtimeTTS 实例（`_instance` 类属性持有）。
@@ -22,7 +23,7 @@ v2 常驻引擎（相对 v1 的关键变化）：
     - `normalize="rms"`：逐句**静态**活动段 RMS 对齐目标 -24 dBFS（治句间音量不齐）；
     - `normalize="agc"`：静态对齐 + **句内动态压缩**（20ms 帧包络逐帧增益，治句首轻/句尾轻/中间响）
       + **短停压缩**（句内深度静音缝超 0.25s 的截短到 0.25s，治 VITS 烘焙进波形的逗号死寂收音）。
-  在 `_synth` 边界生效——播放、save_wav、save_chunks_dir、speak_to_file 同时受益。
+  在后端 `synth`/`synth_stream` 边界生效——播放、save_wav、save_chunks_dir、speak_to_file 同时受益。
 
 典型用法（实时场景）：
     tts = RealtimeTTS(mode="bargein")   # 常驻引擎，只创建一次
@@ -36,39 +37,13 @@ import re
 import queue
 import threading
 import time
-import wave
-
-_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-# 必须在 import melo / torch 之前设置，确保权重缓存落在项目内
-os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_DIR, ".cache", "hf"))
-# huggingface.co 直连被墙时走镜像（仅首次下载用，运行期零网络）；可用环境变量覆盖
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-# NLTK 语料（g2p_en 的 cmudict）落到项目内，导入期零联网
-os.environ.setdefault("NLTK_DATA", os.path.join(_PROJECT_DIR, ".cache", "nltk_data"))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from melo.api import TTS  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# 小工具
-# ---------------------------------------------------------------------------
-def save_wav_np(audio, path, samplerate):
-    """把 float32 音频数组写成 16bit PCM WAV（无需 soundfile/scipy 依赖）。"""
-    a = np.asarray(audio)
-    if a.dtype != np.float32:
-        a = a.astype(np.float32)
-    if np.abs(a).max() > 1.0:
-        a = a / 32767.0
-    a = np.clip(a, -1.0, 1.0)
-    pcm = (a * 32767.0).astype(np.int16)
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(int(samplerate))
-        w.writeframes(pcm.tobytes())
+from .audio import save_wav_np  # noqa: E402
+from .backend import get_backend  # noqa: E402
+from .jobs import Job  # noqa: E402
 
 
 def _resolve_device(device):
@@ -79,54 +54,29 @@ def _resolve_device(device):
     return device
 
 
-class Job:
-    """一次文本任务（submit 的返回值）。wait() 阻塞到该任务播完（或被打断取消）。"""
-
-    __slots__ = ("job_id", "gen", "sentences", "n", "save_dir", "save_wav_path",
-                 "t_start", "timing", "_event", "canceled")
-
-    def __init__(self, job_id, gen, sentences, save_dir, save_wav_path, t_start):
-        self.job_id = job_id
-        self.gen = gen
-        self.sentences = sentences
-        self.n = len(sentences)
-        self.save_dir = save_dir
-        self.save_wav_path = save_wav_path
-        self.t_start = t_start
-        self.timing = []           # 逐句记录（profile 开时才有内容）
-        self.canceled = False
-        self._event = threading.Event()
-
-    def wait(self):
-        """阻塞到本任务播完或被取消，返回逐句时序记录（与 speak() 一致）。"""
-        self._event.wait()
-        return self.timing
-
-    def mark_done(self, canceled=False):
-        self.canceled = canceled
-        self._event.set()
-
-
 # ---------------------------------------------------------------------------
 # 主类（单例 + 常驻引擎）
 # ---------------------------------------------------------------------------
 class RealtimeTTS:
     _instance = None            # 单例槽位
-    _init_lock = threading.Lock()
-    # 逐句响度归一化（normalize="rms"）常量：
-    # 目标 = 活动段(非静音) RMS -24 dBFS（≈0.0631）；峰值上限 0.95，超则整体下压防爆音。
-    _NORMALIZE_TARGET = 10 ** (-24.0 / 20.0)
-    _NORMALIZE_PEAK_CEIL = 0.95
+    _init_lock = threading.RLock()   # 可重入：__new__ 持锁调 close()，close() 内再取同锁不自锁
 
-    # 单例：任何时刻最多一个活实例。device 变更 → 销毁旧实例重建；
-    # 其余配置（mode/speed）变更 → 原地切换。
-    def __new__(cls, device="auto", speed=None, mode=None, normalize=None, profile=False, debug=False):
+    # 单例：任何时刻最多一个活实例。device/backend 变更 → 销毁旧实例重建；
+    # 其余配置（mode/speed/normalize）变更 → 原地切换。
+    def __new__(cls, device="auto", speed=None, mode=None, normalize=None,
+                backend="melo", voice=None, profile=False, debug=False,
+                max_speech_ratio=None):
         with cls._init_lock:
             inst = cls._instance
             if inst is not None:
                 want = _resolve_device(device)
-                if want != inst._device:
-                    inst._shutdown_engine()   # device 变更：关旧、重建
+                want_bk = (backend or "melo").lower()
+                want_voice = voice if want_bk == "cosy" else None   # voice 仅 cosy 后端有含义
+                want_ratio = max_speech_ratio if want_bk == "cosy" else None
+                if (want != inst._device or want_bk != inst._backend_name
+                        or want_voice != getattr(inst, "_voice", None)
+                        or want_ratio != getattr(inst, "_max_speech_ratio", None)):
+                    inst._shutdown_engine()   # device/backend/voice/长度上限变更：关旧、重建
                     cls._instance = None
                 else:
                     return inst
@@ -134,7 +84,9 @@ class RealtimeTTS:
             cls._instance = obj
             return obj
 
-    def __init__(self, device="auto", speed=None, mode=None, normalize=None, profile=False, debug=False):
+    def __init__(self, device="auto", speed=None, mode=None, normalize=None,
+                 backend="melo", voice=None, profile=False, debug=False,
+                 max_speech_ratio=None):
         # 已是常驻实例：只做运行期可变的配置（mode/speed/normalize），None 表示"不改"。
         if getattr(self, "_inited", False):
             if mode is not None:
@@ -145,53 +97,90 @@ class RealtimeTTS:
                 self.normalize = normalize
             return
 
-        self._device = _resolve_device(device)
-        self._speed = 1.0 if speed is None else float(speed)
-        self.mode = "queue" if mode is None else mode
-        self.normalize = normalize          # None=不处理；"rms"=逐句 RMS 响度均衡
-        self._profile = profile
-        self._debug = debug
-        self._closed = False
-        self._shutdown = False
-        self._gen = 0
-        self._jobs = queue.Queue()                 # 文本级任务队列（无界，可积压）
-        self._audio_q = queue.Queue(maxsize=8)     # 音频块队列（有界，天然背压）
-        self._synth_lock = threading.Lock()        # 模型非线程安全，串行化 _synth
-        self._submit_lock = threading.Lock()       # submit/interrupt 临界区
-        self._timing_lock = threading.Lock()
-        self._job_counter = 0
-        self.last_ttfa = None
-        self.last_timing = []
+        try:
+            self._device = _resolve_device(device)
+            self._backend_name = (backend or "melo").lower()
+            self._voice = voice if self._backend_name == "cosy" else None
+            # cosy 后端 LLM EOS 不可靠（见 docs/README-cosyvoice2.md），max_speech_ratio
+            # 把单句生成 token 上限从默认 20×text 收紧（None=模型默认），换取可控时长。
+            self._max_speech_ratio = max_speech_ratio if self._backend_name == "cosy" else None
+            self._speed = 1.0 if speed is None else float(speed)
+            self.mode = "queue" if mode is None else mode
+            self.normalize = normalize          # None=不处理；"rms"=逐句 RMS 响度均衡
+            self._profile = profile
+            self._debug = debug
+            self._closed = False
+            self._shutdown = False
+            self._gen = 0
+            self._jobs = queue.Queue()                 # 文本级任务队列（无界，可积压）
+            self._audio_q = queue.Queue(maxsize=8)     # 音频块队列（有界，天然背压）
+            self._synth_lock = threading.Lock()        # 后端模型非线程安全，串行化合成
+            self._submit_lock = threading.Lock()       # submit/interrupt 临界区
+            self._timing_lock = threading.Lock()
+            self._job_counter = 0
+            self.last_ttfa = None
+            self.last_timing = []
 
-        if self._debug:
-            self._env_banner()
+            if self._debug:
+                self._env_banner()
 
-        t0 = time.perf_counter()
-        if self._debug:
-            self._ensure_weights()
-        self._model = TTS(language="ZH", device=self._device)
-        self._sr = int(getattr(self._model.hps.data, "sampling_rate", 44100))
-        self._spk = self._model.hps.data.spk2id["ZH"]
-        t_load = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            backend_cfg = {}
+            if self._backend_name == "cosy":
+                backend_cfg["voice"] = self._voice
+                if self._max_speech_ratio is not None:
+                    backend_cfg["max_speech_ratio"] = self._max_speech_ratio
+            self._backend = get_backend(self._backend_name, device=self._device,
+                                        debug=self._debug, **backend_cfg)
+            self._backend.load()
+            self._sr = int(self._backend.sr)
+            t_load = time.perf_counter() - t0
 
-        # 预热：cudnn / 首次推理缓存，不计入验收
-        t0 = time.perf_counter()
-        with self._synth_lock:
-            self._synth("你好。")
-        t_warm = time.perf_counter() - t0
+            # 预热：cudnn / 首次推理缓存，不计入验收
+            t0 = time.perf_counter()
+            with self._synth_lock:
+                self._backend.synth("你好。", speed=self._speed, normalize=self._normalize)
+            t_warm = time.perf_counter() - t0
 
-        if self._debug:
-            print("[debug] 模型加载 %.2fs（含预热 %.2fs） device=%s sr=%d mode=%s"
-                  % (t_load, t_warm, self._device, self._sr, self._mode))
-            print("[debug] HF 权重缓存目录: %s" % os.environ["HF_HOME"])
+            if self._debug:
+                print("[debug] 后端=%s 模型加载 %.2fs（含预热 %.2fs） device=%s sr=%d mode=%s"
+                      % (self._backend_name, t_load, t_warm, self._device, self._sr, self._mode))
+                print("[debug] HF 权重缓存目录: %s" % os.environ.get("HF_HOME", "（未设置）"))
 
-        self._start_workers()
-        self._inited = True
+            self._start_workers()
+            self._inited = True
+        except Exception:
+            # 初始化失败：回滚单例槽位，避免后续复用半成品实例（如 backend 依赖未装）
+            bk = getattr(self, "_backend", None)
+            if bk is not None:
+                try:
+                    bk.close()
+                except Exception:
+                    pass
+            with type(self)._init_lock:
+                if type(self)._instance is self:
+                    type(self)._instance = None
+            raise
 
     # ---------------- 配置属性 ----------------
     @property
     def device(self):
         return self._device
+
+    @property
+    def backend(self):
+        """当前后端名（构建期定死，运行期不可换；换后端需重新 RealtimeTTS(...)）。"""
+        return self._backend_name
+
+    @property
+    def voice(self):
+        """cosy 音色（构建期定死）：'default'（内置参考音频）或 'clone:<wav>:<文本>'。melo 恒为 None。"""
+        return self._voice
+
+    @property
+    def max_speech_ratio(self):
+        """cosy 生成上限收紧（构建期定死）：None=模型默认 20×；收紧后时长可控但可能截语尾。melo 恒为 None。"""
+        return self._max_speech_ratio
 
     @property
     def speed(self):
@@ -237,32 +226,6 @@ class RealtimeTTS:
             print("[debug] CPU 核数: %d | torch 线程数: %d"
                   % (os.cpu_count(), torch.get_num_threads()))
 
-    def _ensure_weights(self):
-        """显式预下载 ZH 权重（命中缓存则跳过），打印来源/大小/耗时。失败不影响主流程。"""
-        try:
-            from huggingface_hub import hf_hub_download, try_to_load_from_cache
-            try:
-                from melo.download_utils import LANG_TO_HF_REPO_ID
-                repo = LANG_TO_HF_REPO_ID.get("ZH")
-            except Exception:
-                repo = None
-            if not repo:
-                print("[debug] 未能获取 ZH 权重仓库映射，跳过预下载（仍由 TTS 内部处理）")
-                return
-            for fname in ("config.json", "checkpoint.pth"):
-                cached = try_to_load_from_cache(repo, fname)
-                if cached is not None:
-                    print("[debug] 权重命中缓存: %s <- %s" % (cached, repo))
-                    continue
-                print("[debug] 权重未缓存，将从 HF 下载: repo=%s file=%s" % (repo, fname))
-                t0 = time.perf_counter()
-                path = hf_hub_download(repo_id=repo, filename=fname)
-                dt = time.perf_counter() - t0
-                print("[debug] 下载完成: %s 字节，%.2fs -> %s"
-                      % (os.path.getsize(path), dt, path))
-        except Exception as e:  # 预检失败不阻塞主流程
-            print("[debug] 权重预检失败(不影响主流程): %s" % e)
-
     # ---------------- 常驻线程 ----------------
     def _start_workers(self):
         self._synth_th = threading.Thread(target=self._worker_synth, daemon=True)
@@ -280,7 +243,7 @@ class RealtimeTTS:
     def _run_job(self, job):
         q = self._audio_q
         aborted = True   # for 正常跑完（未 break）才为 False
-        parts = []       # save_wav 时暂存各句 audio（零额外推理，复用已合成数据）
+        parts = []       # save_wav 时暂存各句 chunk（零额外推理，复用已合成数据）
         try:
             for i, sent in enumerate(job.sentences):
                 if self._shutdown or job.gen != self._gen:
@@ -288,27 +251,39 @@ class RealtimeTTS:
                 t_s0 = time.perf_counter() if self._profile else None
                 if self._debug:
                     print("[debug] [合成 句%d/%d] %s" % (i + 1, job.n, sent[:20]))
-                with self._synth_lock:
-                    audio = self._synth(sent)
-                t_s1 = time.perf_counter() if self._profile else None
-                if job.save_dir:
-                    save_wav_np(audio, os.path.join(job.save_dir, "句%02d.wav" % (i + 1)), self._sr)
-                if job.save_wav_path:
-                    parts.append(audio)
                 rec = None
                 if self._profile:
                     rec = {"idx": i, "text": sent,
-                           "synth_start": t_s0, "synth_end": t_s1,
+                           "synth_start": t_s0, "synth_end": None,
                            "play_start": None, "play_end": None,
-                           "audio_dur": len(audio) / self._sr}
+                           "audio_dur": 0.0, "_chunk0": None}
                     with self._timing_lock:
                         job.timing.append(rec)
-                # 元组带上 rec 引用：播放线程直接回填播放时间，免按 idx 查找
-                q.put((job.gen, job, i, sent, audio, rec))
+                sent_parts = []                # save_chunks_dir：句内各 chunk 累加后落盘
+                with self._synth_lock:
+                    for chunk in self._backend.synth_stream(
+                            sent, speed=self._speed, normalize=self._normalize):
+                        if self._shutdown or job.gen != self._gen:
+                            break              # 关停/抢占：停吐后续 chunk
+                        if rec is not None:
+                            rec["audio_dur"] += len(chunk) / self._sr
+                            if rec["_chunk0"] is None:
+                                rec["_chunk0"] = time.perf_counter()   # 首块产出时刻
+                        if job.save_wav_path:
+                            parts.append(chunk)
+                        if job.save_dir:
+                            sent_parts.append(chunk)
+                        # 元组带上 rec 引用：播放线程直接回填播放时间，免按 idx 查找
+                        q.put((job.gen, job, i, sent, chunk, rec))
+                if job.save_dir and sent_parts:
+                    save_wav_np(np.concatenate(sent_parts),
+                                os.path.join(job.save_dir, "句%02d.wav" % (i + 1)), self._sr)
+                if rec is not None:
+                    rec["synth_end"] = time.perf_counter()   # 末块产出时刻
             else:
                 aborted = False
         finally:
-            # save_wav：把已合成的句子拼成一个整段 WAV（被打断则存半截已合成的部分）
+            # save_wav：把已合成的 chunk 拼成一个整段 WAV（被打断则存半截已合成的部分）
             if job.save_wav_path and parts:
                 save_wav_np(np.concatenate(parts), job.save_wav_path, self._sr)
             # 无论完成、被抢占还是关停，都发 DONE 让播放线程收尾该 job（wait() 不悬挂）。
@@ -327,6 +302,7 @@ class RealtimeTTS:
         except Exception:
             stream = sd.OutputStream(samplerate=self._sr, channels=1, dtype="float32")
         stream.start()
+        last_played_idx = None   # debug 打印按句去重（流式下一句多个 chunk）
         try:
             while True:
                 item = self._audio_q.get()
@@ -337,18 +313,21 @@ class RealtimeTTS:
                     canceled = (gen != self._gen)
                     self._finalize_job(job, canceled)
                     job.mark_done(canceled)
+                    last_played_idx = None
                     continue
                 idx, sent, audio, rec = item[2], item[3], item[4], item[5]
                 if gen != self._gen:
                     continue                  # 被抢占的旧块：直接丢弃
                 t_p0 = time.perf_counter() if self._profile else None
-                if self._debug:
+                if self._debug and idx != last_played_idx:
                     print("[debug] [正在播放 句%d/%d] %s" % (idx + 1, job.n, sent[:20]))
+                    last_played_idx = idx
                 self._play_audio(stream, audio, gen)
                 t_p1 = time.perf_counter() if self._profile else None
                 if self._profile and rec is not None:
-                    rec["play_start"] = t_p0
-                    rec["play_end"] = t_p1
+                    if rec["play_start"] is None:
+                        rec["play_start"] = t_p0   # 首块填播放起点（ttfa/wait 口径）
+                    rec["play_end"] = t_p1         # 末块填播放终点（逐块刷新取最后一次）
         finally:
             # 关停退出前清空队列里残留的块/DONE 并就地标记其 Job，避免对应 wait() 悬挂
             # （正常完成但 DONE 尚未被本线程处理的 job，也在这里兜底标记 canceled）
@@ -378,9 +357,12 @@ class RealtimeTTS:
         if self._profile and timing and not canceled:
             t_start = job.t_start
             for rec in timing:
+                c0 = rec.get("_chunk0")
                 rec["ttfa"] = rec["play_start"] - t_start
                 rec["synth_dur"] = rec["synth_end"] - rec["synth_start"]
-                rec["wait"] = rec["play_start"] - rec["synth_end"]
+                # 流式下首块产出时刻早于整句合成结束，wait 取首块口径（melo 两者一致）
+                rec["wait"] = rec["play_start"] - (c0 if c0 is not None else rec["synth_end"])
+                rec.pop("_chunk0", None)   # 内部字段：算完即删，对外 schema 干净
             for idx in range(1, len(timing)):
                 prev, cur = timing[idx - 1], timing[idx]
                 cur["interval"] = cur["play_start"] - (prev["play_start"] + prev["audio_dur"])
@@ -454,7 +436,7 @@ class RealtimeTTS:
         """整段非流式合成并写 WAV（不占常驻播放线程，加锁与流式合成串行）。"""
         os.makedirs(os.path.dirname(os.path.abspath(wav_path)), exist_ok=True)
         with self._synth_lock:
-            audio = self._synth(text)
+            audio = self._backend.synth(text, speed=self._speed, normalize=self._normalize)
         save_wav_np(audio, wav_path, self._sr)
         return wav_path
 
@@ -472,142 +454,6 @@ class RealtimeTTS:
             else:
                 sentences.append(p)
         return sentences
-
-    def _synth(self, text):
-        """整句合成，返回 44.1kHz float32 numpy 数组（[-1,1]）。调用方须持有 _synth_lock。
-
-        归一化开关在此生效：播放、save_wav、save_chunks_dir、speak_to_file 全部走这里。
-        """
-        a = self._model.tts_to_file(
-            text, self._spk, output_path=None, speed=self._speed, quiet=True)
-        if self._normalize:
-            a = self._normalize_audio(a)
-        return a
-
-    def _normalize_audio(self, audio):
-        """归一化分发：normalize="rms"=逐句静态响度对齐（治句间）；"agc"=静态对齐 +
-        句内动态压缩（治句内起伏）+ 短停压缩（治句内超长静音缝）。"""
-        a = self._static_align(audio)
-        if self._normalize == "agc":
-            a = self._pause_cap(a)
-            a = self._agc(a)
-        return a
-
-    def _static_align(self, audio):
-        """逐句静态响度对齐：按"活动段(非静音) RMS"缩放整句，对齐目标响度。
-
-        不用整句 RMS 的原因：VITS 句首句尾常带静音，静音占比句间差异大（实测
-        37%~64%），会稀释整句 RMS——静音多的句子被过度放大、少的被压小，语音段
-        实际响度仍不齐。只按有语音的帧算 RMS 对齐，才接近人耳感知的语音响度。
-        峰值超上限则整体下压防爆音；全静音句跳过。
-        """
-        a = np.asarray(audio, dtype=np.float32)
-        rms_act = self._active_rms(a)
-        if rms_act <= 1e-6:
-            return audio                        # 无活动帧：跳过，避免除零/放大噪声
-        out = a * (self._NORMALIZE_TARGET / rms_act)
-        peak = float(np.abs(out).max())
-        if peak > self._NORMALIZE_PEAK_CEIL:
-            out *= self._NORMALIZE_PEAK_CEIL / peak
-        return out
-
-    def _pause_cap(self, audio, max_pause=0.25, rel_thr=1e-3):
-        """短停压缩（并进 agc）：把句内超过 max_pause 的"深度静音缝"截短到 max_pause。
-
-        背景：VITS 把标点停顿直接烘焙进单个波形，实测逗号处可生成 ~0.6s 的绝对数字
-        静音（-inf dB，远超自然短停顿 ~0.1s），听感是"每逗号之间突然消音没了声音"。
-        本方法检测帧 RMS 低于 rel_thr×peak（≈-60dB 相对峰值，只认真静音、不碰正常
-        呼吸/短停）的连续段，超过上限的从中间抽掉多余静音（两侧各留 max_pause/2 帧，
-        保留原渐入渐出边），静音接静音无咔哒；句首/句尾静音不动，保持句子自然边界。
-        """
-        a = np.asarray(audio, dtype=np.float32)
-        win = max(int(self._sr * 0.02), 1)
-        n = len(a) // win
-        if n == 0:
-            return audio
-        frames = a[:n * win].reshape(n, win)
-        rms_f = np.sqrt(np.mean(frames ** 2, axis=1))
-        peak = float(np.abs(a).max())
-        if peak <= 1e-12:
-            return audio
-        deep = rms_f < rel_thr * peak                # 深度静音帧（真静音，非呼吸）
-        max_frames = max(int(round(max_pause / 0.02)), 1)
-
-        # 收集连续深度静音段
-        runs = []
-        start = None
-        for i, d in enumerate(deep):
-            if d and start is None:
-                start = i
-            elif not d and start is not None:
-                runs.append((start, i - 1))
-                start = None
-        if start is not None:
-            runs.append((start, n - 1))
-        # 排除句首/句尾静音段（保持句子自然边界，不压缩）
-        runs = [r for r in runs if r[0] != 0 and r[1] != n - 1]
-
-        # 超长段：保留两侧 max_pause/2 帧，中间多余静音整段切除
-        cuts = []
-        for s0, s1 in runs:
-            L = s1 - s0 + 1
-            if L <= max_frames:
-                continue
-            head = max_frames // 2
-            tail = max_frames - head
-            cuts.append(((s0 + head) * win, (s1 - tail + 1) * win))
-        if not cuts:
-            return audio
-        out = a
-        for cs, ce in sorted(cuts, reverse=True):    # 从后往前切，避免索引位移
-            out = np.concatenate([out[:cs], out[ce:]])
-        return out
-
-    def _agc(self, audio):
-        """句内动态压缩（AGC）：按 20ms 帧 RMS 包络做逐帧增益，把句内幅度起伏压平到
-        目标响度附近。帧间增益线性插值避免抽吸；噪声门防静音/呼吸被过度放大；
-        增益限幅（最多压 10dB / 抬 16dB）防过度压缩；峰值超上限整体下压。
-        """
-        a = np.asarray(audio, dtype=np.float32)
-        win = max(int(self._sr * 0.02), 1)
-        n = len(a) // win
-        if n == 0:
-            return audio
-        frames = a[:n * win].reshape(n, win)
-        rms_f = np.sqrt(np.mean(frames ** 2, axis=1))
-        gate = max(float(rms_f.max()) * 1e-3, 1e-6)   # 噪声门限（相对本句峰值 RMS）
-        env = np.maximum(rms_f, gate)
-        gain_db = 20.0 * np.log10(self._NORMALIZE_TARGET / env)
-        gain_db = np.clip(gain_db, -10.0, 16.0)   # 最多压 10dB / 抬 16dB
-        gain = 10.0 ** (gain_db / 20.0)
-        centers = win // 2 + np.arange(n) * win
-        out = a[:n * win] * np.interp(np.arange(n * win), centers, gain)
-        if n * win < len(a):
-            out = np.concatenate([out, a[n * win:] * float(gain[-1])])
-        peak = float(np.abs(out).max())
-        if peak > self._NORMALIZE_PEAK_CEIL:
-            out *= self._NORMALIZE_PEAK_CEIL / peak
-        return out
-
-    def _active_rms(self, audio, win_s=0.02, rel_thr=0.02):
-        """按 20ms 帧统计非静音帧的 RMS（能量均值），静音帧不参与。
-
-        关键：活动阈值取**相对句子峰值**的比例（thr = rel_thr × peak），
-        缩放前后峰值等比变化 → 活动帧集合对增益不变，归一化后活动 RMS 精确等于目标
-        （若用固定阈值，放大/缩小后贴边帧会跨入/跨出活动集，测得值偏离目标）。
-        """
-        a = np.asarray(audio, dtype=np.float32)
-        win = max(int(self._sr * win_s), 1)
-        n = len(a) // win
-        if n == 0:
-            return 0.0
-        frames = a[:n * win].reshape(n, win)
-        rms_f = np.sqrt(np.mean(frames ** 2, axis=1))
-        peak = float(np.abs(a).max())
-        act = rms_f[rms_f > rel_thr * peak]
-        if len(act) == 0:
-            return 0.0
-        return float(np.sqrt(np.mean(act ** 2)))
 
     # ---------------- 生命周期 ----------------
     def _shutdown_engine(self):
@@ -634,6 +480,12 @@ class RealtimeTTS:
                 if th is not None:
                     th.join(timeout=10)
         finally:
+            bk = getattr(self, "_backend", None)
+            if bk is not None:
+                try:
+                    bk.close()
+                except Exception:
+                    pass
             with type(self)._init_lock:
                 if type(self)._instance is self:
                     type(self)._instance = None

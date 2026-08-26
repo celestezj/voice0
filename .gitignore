@@ -7,6 +7,12 @@ reports/
 # HF 权重缓存 / bench 结构化数据（本项目内，不入库）
 .cache/
 
+# 第三方仓库（CosyVoice 及其子模块：clone/解包到此，体积大，不入库）
+third_party/
+
+# 诊断/临时脚本与产物（调试 scratch，不属源码，不入库）
+tmp/
+
 # Python
 __pycache__/
 

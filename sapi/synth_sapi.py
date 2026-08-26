@@ -11,7 +11,8 @@ import time
 import pyttsx3
 
 TEXT = "这是一款将 WiFi 无线信号转化为实时空间感知能力的工具，通过分析人体活动引起的信道状态信息变化，无需摄像头或穿戴设备，即可实时还原人体姿态，并检测心率和呼吸。"
-OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
+# 本文件位于 sapi/synth_sapi.py → 输出到项目根 audio/（向上取 1 级）
+OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "audio")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 wav_path = os.path.join(OUT_DIR, "1_sapi_huihui.wav")

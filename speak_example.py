@@ -20,8 +20,8 @@ import sys
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _PROJECT_DIR)
 
-from bench_melo import console_gantt  # noqa: E402  复用验收脚本的甘特图渲染
-from tts_melo import RealtimeTTS      # noqa: E402
+from bench.console_gantt import console_gantt  # noqa: E402  复用验收脚本的甘特图渲染
+from tts.core.engine import RealtimeTTS       # noqa: E402
 
 
 def _prompt_choice(title, options, default):
@@ -39,6 +39,31 @@ def _prompt_choice(title, options, default):
 
 
 def main():
+    backend = _prompt_choice("后端引擎", [
+        (1, "melo", "melo （默认）MeloTTS：中文女声、TTFA<1s、实时主力"),
+        (2, "cosy", "cosy  CosyVoice2：音质更佳 + 3s 音色克隆（首块 ~1-2s，需装依赖）"),
+    ], "melo")
+    voice = None
+    if backend == "cosy":
+        v = _prompt_choice("cosy 音色", [
+            (1, "default", "default （推荐）内置参考女声"),
+            (2, "clone", "clone:<参考wav>:<转写文本> 用自己的 3s 录音克隆音色"),
+        ], "default")
+        if v == "clone":
+            wav = input("参考音频 WAV 路径 > ").strip()
+            txt = input("该音频的转写文本 > ").strip()
+            voice = "clone:%s:%s" % (wav, txt)
+        else:
+            voice = v
+    max_speech_ratio = None
+    if backend == "cosy":
+        s = input("生成长度上限 max_speech_ratio [回车=默认(None)] > ").strip()
+        if s:
+            try:
+                max_speech_ratio = float(s)
+            except ValueError:
+                print("无效数字，用默认 None（cosy 0.5B 的 LLM EOS 不可靠，短句会拖长；"
+                      "收紧到 8 左右可换取可控时长，代价是可能截语尾）")
     mode = _prompt_choice("播放模式", [
         (1, "queue", "queue  （默认）新文本排队，播完再说"),
         (2, "bargein", "bargein        新文本打断当前播放"),
@@ -54,10 +79,12 @@ def main():
         (3, "agc", "agc 句内动态压缩 + 短停压缩 + 句间对齐（推荐）"),
     ], None)
 
-    print("\n正在加载 MeloTTS（模型加载 + 预热，首次约 10-30s）...")
-    tts = RealtimeTTS(device=device, mode=mode, normalize=normalize, profile=True)
-    print("就绪！当前 mode=%s device=%s normalize=%s"
-          % (tts.mode, tts.device, tts.normalize))
+    print("\n正在加载 %s（模型加载 + 预热，melo 首次约 10-30s，cosy 更久）..." % backend.upper())
+    tts = RealtimeTTS(device=device, backend=backend, voice=voice,
+                      mode=mode, normalize=normalize, profile=True,
+                      max_speech_ratio=max_speech_ratio)
+    print("就绪！当前 backend=%s voice=%s mode=%s device=%s normalize=%s max_speech_ratio=%s"
+          % (tts.backend, tts.voice, tts.mode, tts.device, tts.normalize, tts.max_speech_ratio))
     print("输入一段文本回车即播报；输入 exit 退出。\n")
 
     seq = 0
