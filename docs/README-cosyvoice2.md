@@ -121,6 +121,50 @@ tts.close()
 
 `text_frontend` 后端默认 `True`（走 wetext 中文归一化：数字/单位/标点规范化）。改 `False` 可更贴官方 demo 音色，但短句/数字文本会更不稳，一般不推荐。
 
+### 5.5 代码使用案例（完整可跑）
+
+> cosy 与 melo **不能同进程混用**（后端会在 import 时明确报错）。下面示例只碰 cosy 路径；
+> 首次构造会加载模型 ~60s（二次进程 OS 缓存已热会快不少），属正常现象。
+
+```python
+# -*- coding: utf-8 -*-
+"""CosyVoice2 后端完整使用案例。用 voice-tts 环境跑：
+   D:/anaconda/envs/voice-tts/python.exe examples/cosy_demo.py   # 或直接整段贴进脚本
+"""
+from tts import RealtimeTTS
+
+# 1) 默认音色 → 整段生成文件（cosy 主用途：非流式一次解码、句内无缝）
+with RealtimeTTS(device="cuda", backend="cosy", voice="default") as tts:
+    tts.speak_to_file("今天天气真不错，适合出门走走。", "audio/cosy_default.wav")
+
+# 2) 3s 音色克隆 → voice = "clone:<参考wav>:<该音频的转写文本>"
+with RealtimeTTS(device="cuda", backend="cosy",
+                 voice="clone:E:/data/voice.wav:我的声音转写文本") as tts:
+    tts.speak_to_file("用我的声音说这句话。", "audio/cosy_mine.wav")
+
+# 3) 实时播放：submit 非阻塞入队 / speak 阻塞播完（每句整句合成后播放，句内无缝）
+tts = RealtimeTTS(device="cuda", backend="cosy", voice="default", mode="queue")
+tts.submit("第一句话。")          # 入队即返回
+tts.submit("第二句话。")          # 排在第一句之后
+tts.speak("阻塞播完这句再返回。") # 同队列，会把前面排队的先播完
+tts.close()                       # 常驻单例，必须显式 close（del 不保证生效）
+
+# 4) 进阶：收紧 LLM 生成上限 + 播放同时留档
+tts = RealtimeTTS(device="cuda", backend="cosy", voice="default",
+                  max_speech_ratio=8, normalize="rms")
+tts.speak("留档这段。", save_wav="audio/full.wav", save_chunks_dir="audio/chunks/")
+tts.close()
+
+# 5) 流式 vs 非流式（stream 参数）
+with RealtimeTTS(device="cuda", backend="cosy", voice="default") as tts:          # 非流式（默认 stream=False）
+    tts.speak("非流式：每句一次解码、单块播放，句内零拼接缝；首包要等整句合成完。")
+
+with RealtimeTTS(device="cuda", backend="cosy", voice="default", stream=True) as tts:  # 原生 token 级流式
+    tts.speak("流式：逐 token 边合成边播，首包更快；但本机 2070S fp32 RTF>1 会块间停顿，不推荐。")
+
+# 说明：stream 不是运行期开关（改它走"销毁重建"，见 §5 API 表）；stream=True 时 speed 参数被忽略。
+```
+
 ---
 
 ## 6. 验收实测（RTX 2070 SUPER 8GB，2026-08-26）
