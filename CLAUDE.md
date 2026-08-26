@@ -62,6 +62,7 @@ third_party/     克隆的上游仓库（CosyVoice + Matcha-TTS，gitignored）
 - `README.md`「常驻引擎 v2」（§1-§8）= 引擎完整设计：单例机制、线程数据流、queue/bargein 模式、`_gen` 抢占、生命周期、API 参考、使用案例、线程安全坑。**改引擎代码前必读。**
 - `docs/README-cosyvoice2.md` = cosy 完整文档：安装/音色配置/API/验收实测（含 fp16 已排除结论、句间停顿为固有代价）/已知限制。
 - `docs/tts-architecture-decision.md` = 选型结论与硬件环境（新设备复现以 README 为准）。
+- `docs/ai-project-methodology.md` = 本项目沉淀的 **AI 项目全流程方法论**（立案→探索→实施→测试→迭代→文档→复现，含验收纪律/探针文化/反模式清单），可复用到其他 AI 项目。
 
 ## 协作习惯（本项目）
 

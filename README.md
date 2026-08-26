@@ -9,6 +9,8 @@
 ## TTS 选型结论（2026-08 定案）
 
 > 完整选型依据（目标/硬件/候选对比/验收约定/来源）见 `docs/tts-architecture-decision.md`。
+>
+> 本项目从立案到交付的全流程方法论（选型/验收/迭代/文档/复现，可复用到其他 AI 项目）见 **[`docs/ai-project-methodology.md`](docs/ai-project-methodology.md)**。
 
 **目标约束**：离线、流式（TTFA + 边合成边播）、平衡 CPU/GPU 速度与音质。
 
