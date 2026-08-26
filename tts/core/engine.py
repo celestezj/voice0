@@ -65,7 +65,7 @@ class RealtimeTTS:
     # 其余配置（mode/speed/normalize）变更 → 原地切换。
     def __new__(cls, device="auto", speed=None, mode=None, normalize=None,
                 backend="melo", voice=None, profile=False, debug=False,
-                max_speech_ratio=None):
+                max_speech_ratio=None, stream=None):
         with cls._init_lock:
             inst = cls._instance
             if inst is not None:
@@ -73,10 +73,12 @@ class RealtimeTTS:
                 want_bk = (backend or "melo").lower()
                 want_voice = voice if want_bk == "cosy" else None   # voice 仅 cosy 后端有含义
                 want_ratio = max_speech_ratio if want_bk == "cosy" else None
+                want_stream = bool(stream) if want_bk == "cosy" else None
                 if (want != inst._device or want_bk != inst._backend_name
                         or want_voice != getattr(inst, "_voice", None)
-                        or want_ratio != getattr(inst, "_max_speech_ratio", None)):
-                    inst._shutdown_engine()   # device/backend/voice/长度上限变更：关旧、重建
+                        or want_ratio != getattr(inst, "_max_speech_ratio", None)
+                        or want_stream != getattr(inst, "_stream", None)):
+                    inst._shutdown_engine()   # device/backend/voice/长度上限/流式开关变更：关旧、重建
                     cls._instance = None
                 else:
                     return inst
@@ -86,7 +88,7 @@ class RealtimeTTS:
 
     def __init__(self, device="auto", speed=None, mode=None, normalize=None,
                  backend="melo", voice=None, profile=False, debug=False,
-                 max_speech_ratio=None):
+                 max_speech_ratio=None, stream=None):
         # 已是常驻实例：只做运行期可变的配置（mode/speed/normalize），None 表示"不改"。
         if getattr(self, "_inited", False):
             if mode is not None:
@@ -101,9 +103,13 @@ class RealtimeTTS:
             self._device = _resolve_device(device)
             self._backend_name = (backend or "melo").lower()
             self._voice = voice if self._backend_name == "cosy" else None
-            # cosy 后端 LLM EOS 不可靠（见 docs/README-cosyvoice2.md），max_speech_ratio
-            # 把单句生成 token 上限从默认 20×text 收紧（None=模型默认），换取可控时长。
+            # cosy 后端 LLM 生成长度有随机性（transformers 修复后已基本解决，见
+            # docs/README-cosyvoice2.md §8），max_speech_ratio 把单句生成 token 上限
+            # 从默认 20×text 收紧（None=模型默认），作为可选安全阀。
             self._max_speech_ratio = max_speech_ratio if self._backend_name == "cosy" else None
+            # cosy 播放方式：False=整句一次合成后播放（推荐，句内无缝；本机 fp32 RTF>1，
+            # 原生流式会块间饿死停顿 + 拼接缝）；True=原生 token 级流式（追求首包延迟）。
+            self._stream = bool(stream) if self._backend_name == "cosy" else None
             self._speed = 1.0 if speed is None else float(speed)
             self.mode = "queue" if mode is None else mode
             self.normalize = normalize          # None=不处理；"rms"=逐句 RMS 响度均衡
@@ -130,6 +136,8 @@ class RealtimeTTS:
                 backend_cfg["voice"] = self._voice
                 if self._max_speech_ratio is not None:
                     backend_cfg["max_speech_ratio"] = self._max_speech_ratio
+                if self._stream is not None:
+                    backend_cfg["stream"] = self._stream
             self._backend = get_backend(self._backend_name, device=self._device,
                                         debug=self._debug, **backend_cfg)
             self._backend.load()
@@ -181,6 +189,11 @@ class RealtimeTTS:
     def max_speech_ratio(self):
         """cosy 生成上限收紧（构建期定死）：None=模型默认 20×；收紧后时长可控但可能截语尾。melo 恒为 None。"""
         return self._max_speech_ratio
+
+    @property
+    def stream(self):
+        """cosy 播放方式（构建期定死）：False=整句一次合成后播放（推荐）；True=原生 token 级流式。melo 恒为 None。"""
+        return self._stream
 
     @property
     def speed(self):

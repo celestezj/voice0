@@ -19,7 +19,7 @@
 ## 选型结论（2026 版开源 TTS 横向对比，来源见文末）
 
 - **MeloTTS**：首选（**已实现，实时主力**）。CPU 原生实时、MIT、模型 ~60–100MB、离线、中文"较自然"，无音色克隆、表现力有限。GPU 更快。单句 TTFA <1s 硬指标达标。
-- **CosyVoice2 (0.5B)**：音质上限（**已实现，第二后端，可选项**）。原生流式 + 3s 音色克隆 + 方言，中文第一梯队；代价是 CPU 慢、需 GPU（实测 ~2.9GB VRAM）、依赖链重（LLM + flow matching + vocoder + CUDA）、首包 ~2.5–2.9s 达不到 <1s、**0.5B LLM 生成长度有随机性**（transformers 修复后已基本解决，见下节 ⚠️）。
+- **CosyVoice2 (0.5B)**：音质上限（**已实现，第二后端，可选项**）。原生流式能力 + 3s 音色克隆 + 方言，中文第一梯队；本机 RTX 2070S fp32 下 RTF≈1.2 撑不起实时流式（块间饿死），**播放改整句非流式（`stream=False`，句内无缝）**；代价是 CPU 慢、需 GPU（实测 ~2.9GB VRAM）、依赖链重（LLM + flow matching + vocoder + CUDA）、句首等待 ~5.6–6.2s（=整句合成耗时）达不到 <1s、**0.5B LLM 生成长度有随机性**（transformers 修复后已基本解决，见下节 ⚠️）。
 - **MOSS-TTS-Nano (0.1B, 2026-04)**：新候选。纯 CPU 原生流式、支持中文 + 音色克隆、有去 PyTorch 的 ONNX 版（~2× 快）；太新、实战验证少，待实测。
 - **排除**：edge-tts / Azure / 火山等**云端**（需求明确要求离线）；纯自回归音频大模型（GPT-4o audio 类，端到端普遍 >1s）。
 
@@ -31,7 +31,7 @@
 - **`RealtimeTTS` 新增** `backend="melo"|"cosy"`、`voice`（cosy 专属）、`max_speech_ratio`（cosy 专属，见下）。
 - **实现**（`tts/cosy/backend.py`）：权重经 HF 镜像落 `.cache/hf`；`CosyVoice2(load_jit/trt/vllm/fp16 全关)` fp32；`voice="default"`（内置 `assets/cosy_default_female.wav` + `add_zero_shot_spk` 缓存）｜`"clone:<wav>:<文本>"`（3s 零样本克隆）；`text_frontend=True`（wetext，无需 pynini）。
 - **三个 third_party patch**（vendored，均因 0.5B 精简依赖链）：① Matcha `pylogger.py` `rank_zero_only` 本地化（免 lightning）；② Matcha `utils/__init__.py` 只保留 pylogger import（免 hydra/lightning）；③ `file_utils.py` `load_wav` 改用 soundfile（torchaudio 2.x 强制 torchcodec 未装）。backend 内另有 `_force_cpu_onnx()`（campplus/speech_tokenizer 强制 CPU provider）、`_ensure_wetext_local()`（wetext FST 缓存零联网，防 modelscope 403）、`_silence_tqdm()`。
-- **实测（RTX 2070S，修复后重跑，2026-08-26）**：加载 62.1s/53.5s；句1 TTFA 2.532s（默认）/ 2.873s（克隆）；峰值显存 2.85GB/2.93GB；4 句源文本经 **Whisper-medium 转写内容正确** ✅。达不到 melo <1s 硬指标，如实记录——实时主力仍是 melo。⚠️ 接入初期的旧数字（TTFA≈1.5/1.8s、克隆显存 4.57GB）作废——那是坏管线的产物；音质/克隆效果以修复后的试听为准。
+- **实测（RTX 2070S，非流式播放 stream=False，2026-08-26）**：加载 61.5s/52.7s；句1 TTFA 5.584s（默认）/ 6.244s（克隆，=整句合成耗时）；峰值显存 2.88GB/2.98GB；4 句源文本经 **Whisper-medium 转写内容正确** ✅；句间无缝（interval≈0），总跨度 17.8s/19.2s。达不到 melo <1s 硬指标，如实记录——实时主力仍是 melo。⚠️ 接入初期的旧数字（TTFA≈1.5/1.8s、克隆显存 4.57GB）与修复后 token 级流式（TTFA 2.5/2.9s）均作废——前者是坏管线吐杂音，后者在 2070S 上块间饿死、不可听；音质/克隆效果以修复后的试听为准。
 - **⚠️ transformers 版本坑（2026-08-26 修复，本项目最重要的一次排障）**：main env 的 transformers 4.57.6 与 CosyVoice2 不兼容（官方 [issue #1546](https://github.com/FunAudioLLM/CosyVoice/issues/1546)：>4.51.3 即出问题；4.53+ 重写 `Qwen2Model.forward`）→ LLM 产出全错 speech token → **用户实测"一句输入，多次输出、全是杂音、没完没了"**（Whisper 听写为单字重复如"我哭哭哭哭"）。诊断链路：频谱/基频证明是"人声性"噪声而非白噪 → flow/hifigan 在参考音频自身 token/mel 上能还原参考 ✓ → 定位在 LLM 生成的 token → 版本对比锁定 transformers。修复：vendored `transformers 4.51.3 + tokenizers 0.21.1` 于 `.cache/pinned_transformers`（`setup_cosy_pinned.py` 落盘，94M），`tts/cosy/backend.py` import 时注入；melo 用 main env 4.57.6 不受影响。修复后 Whisper(base/small/medium) 听写**内容正确**、生成**有界**。**cosy 与 melo 不能同进程混用**（明确报错不产杂音）。
 - **生成长度（修复后已基本解决）**：接入初期测得的"EOS 不可靠/时长随机/短句必冲上限"（当时 EOS 概率 <2%、rank 200–1500）其实是坏 transformers 的产物。pin 4.51.3 后实测生成有界、时长与文本长度成比例——8 字 → 51~78 token（~1.3-1.9s）、44 字 → 232~264（~5.8-6.6s）、76 字 → 413（~10.3s），都远低于 20×上限；仅保留正常采样随机性（±1.5×）。`max_speech_ratio` 降级为**可选安全阀**。详见 `docs/README-cosyvoice2.md` §8。
 

@@ -41,7 +41,7 @@ def _prompt_choice(title, options, default):
 def main():
     backend = _prompt_choice("后端引擎", [
         (1, "melo", "melo （默认）MeloTTS：中文女声、TTFA<1s、实时主力"),
-        (2, "cosy", "cosy  CosyVoice2：音质更佳 + 3s 音色克隆（首块 ~1-2s，需装依赖）"),
+        (2, "cosy", "cosy  CosyVoice2：音质更佳 + 3s 音色克隆（整句合成后播放、句内无缝，需装依赖）"),
     ], "melo")
     voice = None
     if backend == "cosy":
@@ -56,6 +56,7 @@ def main():
         else:
             voice = v
     max_speech_ratio = None
+    stream = None
     if backend == "cosy":
         s = input("生成长度上限 max_speech_ratio [回车=默认(None)] > ").strip()
         if s:
@@ -64,6 +65,10 @@ def main():
             except ValueError:
                 print("无效数字，用默认 None（cosy 0.5B 的 LLM EOS 不可靠，短句会拖长；"
                       "收紧到 8 左右可换取可控时长，代价是可能截语尾）")
+        stream = _prompt_choice("播放方式", [
+            (1, False, "整句合成后播放 （默认/推荐）每句一次解码、句内无缝；句首等待=整句合成耗时"),
+            (2, True, "原生 token 级流式  首块更快，但本机 2070S fp32 RTF>1，块间会饿死停顿 + 拼接缝"),
+        ], False)
     mode = _prompt_choice("播放模式", [
         (1, "queue", "queue  （默认）新文本排队，播完再说"),
         (2, "bargein", "bargein        新文本打断当前播放"),
@@ -82,9 +87,9 @@ def main():
     print("\n正在加载 %s（模型加载 + 预热，melo 首次约 10-30s，cosy 更久）..." % backend.upper())
     tts = RealtimeTTS(device=device, backend=backend, voice=voice,
                       mode=mode, normalize=normalize, profile=True,
-                      max_speech_ratio=max_speech_ratio)
-    print("就绪！当前 backend=%s voice=%s mode=%s device=%s normalize=%s max_speech_ratio=%s"
-          % (tts.backend, tts.voice, tts.mode, tts.device, tts.normalize, tts.max_speech_ratio))
+                      max_speech_ratio=max_speech_ratio, stream=stream)
+    print("就绪！当前 backend=%s voice=%s mode=%s device=%s normalize=%s max_speech_ratio=%s stream=%s"
+          % (tts.backend, tts.voice, tts.mode, tts.device, tts.normalize, tts.max_speech_ratio, tts.stream))
     print("输入一段文本回车即播报；输入 exit 退出。\n")
 
     seq = 0

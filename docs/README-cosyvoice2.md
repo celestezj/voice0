@@ -1,6 +1,6 @@
 # CosyVoice2-0.5B 后端（voice0 第二引擎）
 
-> 定位：与 MeloTTS **互补**的第二后端。melotts 只有一种中文女声、无音色克隆；cosy 提供 **中文第一梯队音质 + 任意 3s 参考音频零样本克隆**。代价是首块 ~2.5s（达不到 melo <1s 硬指标）、需 GPU 常驻、且 **0.5B LLM 生成长度有随机性**（见 §8）。实时主力仍是 melo，cosy 是"音质 + 克隆"可选项。
+> 定位：与 MeloTTS **互补**的第二后端。melotts 只有一种中文女声、无音色克隆；cosy 提供 **中文第一梯队音质 + 任意 3s 参考音频零样本克隆**。代价是句首等待 ~5.6-6.2s（=整句合成耗时，达不到 melo <1s 硬指标）、需 GPU 常驻、且 **0.5B LLM 生成长度有随机性**（见 §8）。实时主力仍是 melo，cosy 是"音质 + 克隆"可选项。
 >
 > 后端实现：`tts/cosy/backend.py`（`CosyBackend`，选择性安装，缺依赖时报 `BackendNotInstalledError` 带安装提示）。
 
@@ -16,7 +16,7 @@
 | 音色 | 固定中文女声 | **默认女声 + 任意 3s 参考音频克隆** |
 | 采样率 | 44.1kHz | 24kHz |
 | 流式 | 句子级分块（模拟） | **原生 token 级流式**（逐块 ~1s） |
-| 首块 TTFA（实测） | ~0.2s（GPU）/ ~0.9s（CPU） | **~2.5s（默认）/ ~2.9s（克隆）** |
+| 句1 TTFA（实测，非流式） | ~0.2s（GPU）/ ~0.9s（CPU） | **~5.6s（默认）/ ~6.2s（克隆）** |
 | 设备 | CPU 原生实时 | CPU 极慢，**需 GPU**（~3-4.6GB 显存） |
 | 生成长度 | 稳定 | **随机不可控**（见下） |
 | 依赖 | pip 轻量 | 第三方仓库 + 重依赖链 |
@@ -105,16 +105,19 @@ tts.close()
 
 ## 5. API 与用法
 
-引擎接口与 melo 完全一致（`tts/core/engine.py`），只多 `backend` / `voice` / `max_speech_ratio` 参数：
+引擎接口与 melo 完全一致（`tts/core/engine.py`），只多 `backend` / `voice` / `max_speech_ratio` / `stream` 参数：
 
 | 用法 | 代码 |
 |---|---|
-| 默认音色流式 | `RealtimeTTS(device="cuda", backend="cosy", voice="default")` |
+| 默认播放（整句合成后播放，推荐） | `RealtimeTTS(device="cuda", backend="cosy", voice="default")`（`stream=False` 默认） |
 | 3s 克隆 | `RealtimeTTS(device="cuda", backend="cosy", voice="clone:<wav>:<文本>")` |
 | 收紧生成上限 | `RealtimeTTS(..., max_speech_ratio=8)`（默认 None=模型行为） |
+| 恢复原生 token 级流式 | `RealtimeTTS(..., stream=True)`（首包更快，但本机 RTF>1 会块间停顿，不推荐） |
 | 整段生成（cosy 主用途） | `tts.speak_to_file(text, "out.wav")`（非流式，内部聚合） |
-| 实时流式播放 | `tts.speak(text)` / `tts.submit(text)`（原生 token 级流式） |
-| 命令行 demo | `python speak_example.py`（启动菜单选 cosy + 音色） |
+| 播放 | `tts.speak(text)` / `tts.submit(text)`（每句合成完一次性播放，句内无缝） |
+| 命令行 demo | `python speak_example.py`（启动菜单选 cosy + 音色 + 播放方式） |
+
+**为什么默认非流式（2026-08-26 改）**：本机 2070S fp32 下 cosy RTF≈1.1-1.3，**合成比实时播放还慢**——token 级流式逐块 yield 播放时，上一块播完、下一块还没合成出来（块间饿死），听起来就是"字间戛然而止/明显停顿"；且每个 yield 是独立 flow→hifigan 解码，块边界有声学接缝（再叠加块级 normalize 的响度跳变）。改 `stream=False`（`inference_zero_shot` 非流式）后：每句一次 LLM→flow→hifigan 解码、单块播放，**句内零拼接缝**；`speed` 参数也终于生效（流式下被忽略）。代价是句首等待 = 整句合成耗时（约 1.2× 音频时长），句间停顿即下一句的整句合成时间。**实时 <1s 仍由 melo 承担**；cosy 适合"整段生成 + 试听 + 必要时重生成"。
 
 `text_frontend` 后端默认 `True`（走 wetext 中文归一化：数字/单位/标点规范化）。改 `False` 可更贴官方 demo 音色，但短句/数字文本会更不稳，一般不推荐。
 
@@ -123,25 +126,26 @@ tts.close()
 ## 6. 验收实测（RTX 2070 SUPER 8GB，2026-08-26）
 
 ```
-CosyVoice2 bench: device=cuda（bench/bench_cosy.py --device cuda，transformers 修复后重跑）
+CosyVoice2 bench: device=cuda（bench/bench_cosy.py --device cuda，非流式播放 stream=False）
 文本：这是一款将 WiFi 无线信号转化为实时空间感知能力的工具。通过分析人体活动引起的信道状态信息变化。无需摄像头或穿戴设备。即可实时还原人体姿态。
-[默认音色] （加载62.1s, 峰值显存 2.85GB）
-  句1 TTFA=2.532s   音频 5.80s
-  句2 TTFA=11.990s  音频 4.52s
-  句3 TTFA=16.301s  音频 2.68s
-  句4 TTFA=18.990s  音频 2.64s
-[3s克隆]   （加载53.5s, 峰值显存 2.93GB）
-  句1 TTFA=2.873s   音频 5.76s
-  句2 TTFA=12.298s  音频 4.24s
-  句3 TTFA=16.319s  音频 2.60s
-  句4 TTFA=19.912s  音频 3.12s
+[默认音色] （加载61.5s, 峰值显存 2.88GB）
+  句1 TTFA=5.584s   音频 5.76s
+  句2 TTFA=11.095s  音频 3.88s
+  句3 TTFA=14.975s  音频 2.80s
+  句4 TTFA=17.795s  音频 3.84s
+[3s克隆]   （加载52.7s, 峰值显存 2.98GB）
+  句1 TTFA=6.244s   音频 5.76s
+  句2 TTFA=11.755s  音频 3.88s
+  句3 TTFA=15.635s  音频 2.80s
+  句4 TTFA=19.247s  音频 3.84s
 ```
 
-- **模型加载 62.1s（默认）/ 53.5s（克隆）**（fp32 纯 torch，jit/trt/vllm 全关；二次进程 OS 缓存已热，会快不少）。
-- **句1 TTFA 2.532s（默认）/ 2.873s（克隆）**——达不到 melo <1s，如实记录。此值为修复后经**完整引擎链**（`RealtimeTTS(backend="cosy")` → `speak()` 流式路径）实测，内容为真实完整语音。
-- **峰值显存 2.85GB（默认）/ 2.93GB（克隆）**——2070S 8GB 可跑。
-- **Whisper-medium 转写验收（修复后，内容正确）**：两个 WAV 均完整还原全部 4 句源文本（"型号/信号"等个别字是 Whisper 的同音自选，非模型漏字）；生成有界、每句音频时长与文本长度成比例（句1 最长句 5.8s，句3/4 短句 ~2.6s）。
-- ⚠️ 本节为**修复后重跑**数据。接入初期的旧数字（TTFA 1.5/1.8s、克隆显存 4.57GB、音频 0.56s/16.00s）全部作废——那是坏 transformers（4.57.6）在吐杂音、冲生成上限时的产物（见文首 ⚠️）。音质/克隆效果以修复后的试听为准。
+- **模型加载 61.5s（默认）/ 52.7s（克隆）**（fp32 纯 torch，jit/trt/vllm 全关；二次进程 OS 缓存已热，会快不少）。
+- **句1 TTFA 5.584s（默认）/ 6.244s（克隆）= 整句合成耗时**（非流式 `stream=False`：每句一次解码后播放）。达不到 melo <1s，如实记录。此值为修复后经**完整引擎链**（`RealtimeTTS(backend="cosy")` → `speak()`）实测，内容为真实完整语音。
+- **峰值显存 2.88GB（默认）/ 2.98GB（克隆）**——2070S 8GB 可跑。
+- **Whisper-medium 转写验收（内容正确）**：两个 WAV 均完整还原全部 4 句源文本（"型号/信号"等个别字是 Whisper 的同音自选，非模型漏字）；生成有界、每句音频时长与文本长度成比例。
+- **句间无缝**：interval ≈ 0/负（句与句首尾相接，无饿死停顿）；总跨度 17.8s/19.2s，比修复前 token 级流式（21.6s/23.0s）还快——因为没有了块间卡顿。每句音频时长有正常采样随机性（±1.5×）。
+- ⚠️ 本节为**修复后非流式**数据。接入初期的旧数字（TTFA 1.5/1.8s、克隆显存 4.57GB、音频 0.56s/16.00s）全部作废——那是坏 transformers（4.57.6）在吐杂音、冲生成上限时的产物（见文首 ⚠️）；修复后 token 级流式的数字（TTFA 2.5/2.9s、总跨度 21.6/23.0s）也已被本表的非流式替代（流式在 2070S 上块间饿死、不可听）。音质/克隆效果以修复后的试听为准。
 
 ---
 

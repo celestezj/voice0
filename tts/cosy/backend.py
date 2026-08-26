@@ -6,14 +6,20 @@
 FunAudioLLM/CosyVoice2-0.5B 落到 .cache/hf（snapshot_download 复用缓存）。
 
 定位：melotts 只能中文女声；cosy 提供"默认女声 + 任意 3s 参考音频克隆"，
-但首块 TTFA 实测 ~1-2s，达不到 melo 的 <1s 硬指标——实时主力仍是 melo，
-cosy 是"音质 + 克隆"可选项。
+但句首等待实测 ~5.6-6.2s（=整句合成耗时，约 1.2×音频时长），达不到 melo 的
+<1s 硬指标——实时主力仍是 melo，cosy 是"音质 + 克隆"可选项。
 
-已知限制（0.5B LLM EOS 不可靠，实测详见 docs/README-cosyvoice2.md）：
-生成长度是随机的，同一句多次合成可差 3-10 倍。短句（<20 token）几乎必
-冲到上限 20×text token（如 11 字 → 8.8s）；长文本有时终止、有时也冲到
-上限。`max_speech_ratio` 可把上限收紧（如 8 → 11 字 ≈3.5s），换取时长
-可预测，代价是可能截断语尾（模型"自然结束"点在 3.5-12× 之间随机）。
+播放方式（默认非流式，2026-08-26 改）：本机 2070S fp32 下 RTF≈1.1-1.3
+（合成比实时播放还慢），cosy 原生流式（token 级逐块 yield）播出来必然
+"字间戛然而止 + 块拼接缝"——播放饿死等下一块、块边界是独立 flow+hifigan
+解码的声学接缝。因此默认 `stream=False`：每句一次 LLM→flow→hifigan 解码、
+单块播放，句内无缝；代价是句首等待 = 整句合成耗时。追求首包延迟时可
+`stream=True` 显式恢复原生流式（本机仍会卡顿，不推荐）。
+
+已知限制（0.5B LLM 生成长度，实测详见 docs/README-cosyvoice2.md §8）：
+接入初期测得的"EOS 不可靠/短句必冲上限"其实是坏 transformers（4.57.6）
+的产物，pin 4.51.3 后生成有界、时长与文本长度成比例（约 5~7 token/字）。
+保留正常的采样随机性（±1.5×）。`max_speech_ratio` 降级为可选安全阀。
 """
 import os
 import sys
@@ -155,12 +161,13 @@ class CosyBackend:
     sr = 24000
 
     def __init__(self, device="auto", voice="default", text_frontend=True, debug=False,
-                 max_speech_ratio=None):
+                 max_speech_ratio=None, stream=False):
         self._device = device
         self._voice = voice
         self._text_frontend = bool(text_frontend)
         self._debug = debug
         self._max_speech_ratio = max_speech_ratio
+        self._stream = bool(stream)   # False=整句一次合成（推荐，句内无缝）；True=原生 token 流式
         self._model = None
         self._prompt_wav = None
         self._prompt_text = None
@@ -219,18 +226,24 @@ class CosyBackend:
         m = self._model
         if self._spk_id:
             gen = m.inference_zero_shot(text, "", "",
-                                        zero_shot_spk_id=self._spk_id, stream=True,
+                                        zero_shot_spk_id=self._spk_id, stream=self._stream,
                                         speed=speed, text_frontend=self._text_frontend)
         else:
             gen = m.inference_zero_shot(text, self._prompt_text, self._prompt_wav,
-                                        stream=True, speed=speed,
+                                        stream=self._stream, speed=speed,
                                         text_frontend=self._text_frontend)
         for j in gen:
             yield j["tts_speech"].detach().cpu().numpy().reshape(-1).astype(np.float32)
 
     def synth_stream(self, text, *, speed=1.0, normalize=None):
-        """原生流式，逐 chunk yield（~1s 粒度）。normalize 在块级聚合应用（
-        melo 整句一次对齐，cosy 流式无法等整句，块级 AGC 仍成立）。"""
+        """默认整句一次合成、单块产出（stream=False）→ 无块拼接缝、无饿死停顿，
+        normalize 在整句聚合后应用（与 melo 同语义）。见类 docstring。
+        stream=True 时退化为原生 token 级流式（块级 normalize，本机 RTF>1 会卡顿）。"""
+        if not self._stream:
+            a = self.synth(text, speed=speed, normalize=normalize)
+            if a.size:
+                yield a
+            return
         from ..core.audio import normalize_audio
         for chunk in self._gen(text, speed=speed):
             if normalize:
@@ -238,7 +251,8 @@ class CosyBackend:
             yield chunk
 
     def synth(self, text, *, speed=1.0, normalize=None):
-        """整句一次合成（聚合流式块）。normalize 在整句聚合后应用（同 melo 语义）。"""
+        """整句一次合成（默认非流式 = 单次解码；stream=True 时聚合流式块）。
+        normalize 在整句聚合后应用（同 melo 语义）。"""
         from ..core.audio import normalize_audio
         parts = list(self._gen(text, speed=speed))
         if not parts:
