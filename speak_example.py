@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
-"""MeloTTS 交互式演示：while + input() 循环，逐段输入实时播报。
+"""TTS 交互式演示（melo / cosy）：while + input() 循环，逐段输入实时播报。
 
 用法：
     python speak_example.py
 
 流程：
-  1. 启动时选择播放模式（queue / bargein）与运行设备（auto / cpu / cuda）；
-  2. 之后循环输入文本（一句话或一段话均可），回车即阻塞播报；
-  3. 每段播完在控制台打印简易时序甘特图（复用 bench_melo.console_gantt）；
+  1. 启动时选择后端、播放模式（queue / bargein）与运行设备等；
+  2. 之后循环输入文本，回车即 `submit()` 非阻塞播报——提示立即返回，可马上输入下一条；
+  3. 每段播完由**后台线程立即打印**简易时序甘特图（不等下一次输入；复用 bench.console_gantt）；
   4. 输入 exit 退出，并 close() 单例 TTS 对象（Ctrl+C / EOF 同样兜底关闭）。
 
 说明：
+  - bargein 模式下，新输入会自动打断当前播放；被打断的半段也会如实画进甘特图
+    （rec 的 play_start/ttfa 可能为 None，console_gantt 已做防御）。
+  - 甘特图打印线程为 daemon：退出时在途任务被 close() 取消，其补打被 _EXITING 抑制。
   - 甘特图依赖 profile 插桩（逐句 4 戳计时 + TTFA/合成/等待派生字段），
     故本 demo 以 profile=True 构造 RealtimeTTS；生产场景按需关闭该开关。
 """
 import os
 import sys
+import threading
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _PROJECT_DIR)
@@ -36,6 +40,27 @@ def _prompt_choice(title, options, default):
         if s.isdigit() and 1 <= int(s) <= len(options):
             return options[int(s) - 1][1]
         print("无效输入，请重试。")
+
+
+_EXITING = False   # 退出中：抑制后台线程补打的甘特图，避免盖过"已关闭"提示
+
+
+def _print_input_gantt(seq, job):
+    """打印一次输入的甘特图（后台线程调用）。阻塞到本段播完/被打断再画。
+    被打断/空分句时给兜底提示。"""
+    job.wait()
+    if _EXITING:
+        return
+    timing = job.timing
+    if not timing:
+        why = "（可能已被打断）" if job.canceled else ""
+        print("\n（输入%d 无有效分句时序%s，跳过甘特图）" % (seq, why))
+        return
+    # 甘特图只画合成/播放条，句号与文本不显示；这里先行打印分句一览便于对照
+    print("\n---- 输入%d 分句一览 ----" % seq)
+    for r in timing:
+        print("  句%d：%s" % (r["idx"] + 1, r["text"]))
+    console_gantt([{"label": "输入%d" % seq, "timing": timing}])
 
 
 def main():
@@ -90,7 +115,10 @@ def main():
                       max_speech_ratio=max_speech_ratio, stream=stream)
     print("就绪！当前 backend=%s voice=%s mode=%s device=%s normalize=%s max_speech_ratio=%s stream=%s"
           % (tts.backend, tts.voice, tts.mode, tts.device, tts.normalize, tts.max_speech_ratio, tts.stream))
-    print("输入一段文本回车即播报；输入 exit 退出。\n")
+    print("输入一段文本回车即播报（submit 非阻塞：提示立即返回，可马上输入下一条）；"
+          "每段播完立即打印时序图（后台线程）；输入 exit 退出。\n")
+    if mode == "bargein":
+        print("提示：bargein 模式下，下一条输入会自动打断当前播放（打断的半段也会画进甘特图）。\n")
 
     seq = 0
     try:
@@ -107,16 +135,11 @@ def main():
                 continue
 
             seq += 1
-            timing = tts.speak(text)   # 阻塞播完本段，返回逐句时序记录
-            if not timing:
-                print("（该输入无有效分句，跳过甘特图）")
-                continue
-            # 甘特图只画合成/播放条，句号与文本不显示；这里先行打印分句一览便于对照
-            print("\n---- 输入%d 分句一览 ----" % seq)
-            for r in timing:
-                print("  句%d：%s" % (r["idx"] + 1, r["text"]))
-            console_gantt([{"label": "输入%d" % seq, "timing": timing}])
+            job = tts.submit(text)   # 非阻塞：入队即返回，bargein 下自动打断当前播放
+            # 后台线程等本段播完即打印甘特图（不等下一次输入；daemon，退出不阻塞）
+            threading.Thread(target=_print_input_gantt, args=(seq, job), daemon=True).start()
     finally:
+        _EXITING = True   # 抑制在途任务的补打线程
         print("\n关闭 TTS ...")
         tts.close()
         print("已关闭，再见。")

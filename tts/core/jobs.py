@@ -21,6 +21,11 @@ class Job:
         self.canceled = False
         self._event = threading.Event()
 
+    @property
+    def done(self):
+        """是否已播完/被打断（非阻塞查询；wait() 是阻塞版，永不悬挂）。"""
+        return self._event.is_set()
+
     def wait(self):
         """阻塞到本任务播完或被取消，返回逐句时序记录（与 speak() 一致）。"""
         self._event.wait()
