@@ -373,6 +373,16 @@ def _replace_marker(content, start_marker, end_marker, new_block):
     return content[:s] + start_marker + "\n" + new_block + "\n" + end_marker + "\n" + content[tail_start:]
 
 
+# 只展开源码；gitignored 的产物/第三方仓库目录折叠为单行注释，
+# 避免树里堆几百行生成音频与克隆上游仓库（audio/tmp/third_party 均不入库，见 .gitignore）。
+_COLLAPSE_DIRS = {"audio", "tmp", "third_party"}
+_TREE_NOTES = {
+    "audio": "# 生成的音频/bench 报告（chunks/、bench_report_*.txt、smoke_*.wav 等；gitignored）",
+    "tmp": "# 诊断/临时 scratch（diag_*.py、探针与产物；gitignored）",
+    "third_party": "# 克隆的上游仓库（CosyVoice + Matcha-TTS；gitignored）",
+}
+
+
 def _dir_tree(root):
     skip = {".git", ".cache", "__pycache__", ".claude"}
     lines = []
@@ -383,6 +393,10 @@ def _dir_tree(root):
         files = [e for e in entries if os.path.isfile(os.path.join(path, e)) and e not in skip]
         for i, d in enumerate(dirs):
             last = (i == len(dirs) - 1 and not files)
+            if d in _COLLAPSE_DIRS:
+                # 折叠目录：只列目录名 + 一行注释，不递归（branch 由 last 决定，不影响后续兄弟）
+                lines.append(prefix + ("└── " if last else "├── ") + d + "/  " + _TREE_NOTES[d])
+                continue
             lines.append(prefix + ("└── " if last else "├── ") + d + "/")
             walk(os.path.join(path, d), prefix + ("    " if last else "│   "))
         for i, f in enumerate(files):
