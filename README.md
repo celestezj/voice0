@@ -23,7 +23,7 @@
 
 **结论**：MeloTTS 为首选（CPU 实时、离线、简单、中文较自然）；音质上限为 CosyVoice2（需 GPU 常驻）。排除所有云端方案（用户明确要求离线）。**实施顺序：先 MeloTTS，跑通测量后再试下一个。**
 
-> **现状**：MeloTTS 已落地（验收达标）；**CosyVoice2-0.5B 已作为第二后端接入**（2026-08-26，可选项、选择性安装）——提供 melo 没有的"音质上限 + 任意 3s 参考音频克隆"，代价是首块 ~1.5s、需 GPU、且 0.5B 的 LLM 生成长度有随机性（详见下节与 `docs/README-cosyvoice2.md`）。实时 <1s 硬指标仍由 melo 承担。⚠️ 接入初期曾因 main env 的 transformers 4.57.6 与 CosyVoice2 不兼容（官方 [issue #1546](https://github.com/FunAudioLLM/CosyVoice/issues/1546)）产出杂音，已用 vendored transformers 4.51.3 修复（见下节）。
+> **现状**：MeloTTS 已落地（验收达标）；**CosyVoice2-0.5B 已作为第二后端接入**（2026-08-26，可选项、选择性安装）——提供 melo 没有的"音质上限 + 任意 3s 参考音频克隆"，代价是首块 ~2.5s、需 GPU、且 0.5B 的 LLM 生成长度有随机性（详见下节与 `docs/README-cosyvoice2.md`）。实时 <1s 硬指标仍由 melo 承担。⚠️ 接入初期曾因 main env 的 transformers 4.57.6 与 CosyVoice2 不兼容（官方 [issue #1546](https://github.com/FunAudioLLM/CosyVoice/issues/1546)）产出杂音，已用 vendored transformers 4.51.3 修复（见下节）。
 
 ---
 
@@ -510,7 +510,7 @@ array([-0.0012, -0.0008, 0.0031, ..., 0.0005], dtype=float32)
 
 > 完整安装/依赖/权重/音色配置/已知限制见 **[`docs/README-cosyvoice2.md`](docs/README-cosyvoice2.md)**。本节只放结论。
 
-**定位**：melo 只有一种中文女声；cosy 提供 **音质上限 + 任意 3s 参考音频克隆**（0.5B 无 SFT，"默认音色"从内置参考音频零样本克隆实现）。代价：首块 ~1.5s（达不到 melo <1s 硬指标）、需 GPU 常驻、且 **0.5B LLM 生成长度有随机性**（见下）。
+**定位**：melo 只有一种中文女声；cosy 提供 **音质上限 + 任意 3s 参考音频克隆**（0.5B 无 SFT，"默认音色"从内置参考音频零样本克隆实现）。代价：首块 ~2.5s（达不到 melo <1s 硬指标）、需 GPU 常驻、且 **0.5B LLM 生成长度有随机性**（见下）。
 
 > ⚠️ **修复记录（2026-08-26，务必先读）**：接入初期的"音质/克隆验收"是在**坏管线上测的**——main env 的 transformers 4.57.6 与 CosyVoice2 不兼容（官方 [issue #1546](https://github.com/FunAudioLLM/CosyVoice/issues/1546)：>4.51.3 就出问题；4.53+ 重写了 `Qwen2Model.forward`），LLM 产出全错的 speech token，表现为**"输入一句 → 多次输出、全是杂音、没完没了"**（Whisper 听写是单字重复如"我哭哭哭哭"，不是人声）。已修复：本仓库自带 vendored `transformers==4.51.3 + tokenizers==0.21.1`（`.cache/pinned_transformers`，`setup_cosy_pinned.py` 一键落盘，94M），`tts/cosy/backend.py` import 时自动注入；melo 仍用 main env 的 4.57.6，互不影响。修复后 Whisper(base/small/medium) 听写**内容正确**（短句全对；长句逐字还原，仅公司名/地名的同音字由 Whisper 自选），且**生成有界**（不再没完没了）。**cosy 与 melo 不能在同一进程混用**（transformers 版本冲突，会明确报错而非产杂音）。
 
@@ -527,8 +527,8 @@ tts.speak_to_file("要生成的文本。", "audio/cosy_out.wav")                
 
 | 用例 | 模型加载 | 首句 TTFA | 峰值显存 | 备注 |
 |---|---|---|---|---|
-| 默认音色 | ~16-22s | **~1.5s** | 2.89 GB | 首句 1.509s |
-| 3s 克隆 | ~13s（复用加载） | **~1.8s** | 4.57 GB | 克隆代码路径跑通（音色质量修复后另验，见上 ⚠️） |
+| 默认音色 | 62.1s | **~2.5s** | 2.85 GB | 句1 TTFA=2.532s；Whisper-medium 转写 4 句内容正确 ✅ |
+| 3s 克隆 | 53.5s | **~2.9s** | 2.93 GB | 句1 TTFA=2.873s；克隆代码路径跑通 + Whisper 转写正确（音色质量以修复后试听为准，见上 ⚠️） |
 
 **已知限制（修复后已基本解决）**：接入初期测得的"生成时长随机 / 短句必冲上限 / 没完没了"其实是坏 transformers（4.57.6）的产物（见上 ⚠️），pin 到 4.51.3 后实测**生成有界、时长与文本长度成比例**（约 5~7 token/字，音频 ≈ token×25ms），仅保留正常的采样随机性（同句 token 数 ±1.5×）。`max_speech_ratio` 降级为**可选安全阀**（如 8 → 11 字 ≈3.5s），一般不必收紧。**实时 <1s 主力仍是 melo**，cosy 适合"整段生成 + 试听 + 必要时重生成"。
 
