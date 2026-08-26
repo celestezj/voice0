@@ -20,10 +20,10 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("NLTK_DATA", os.path.join(_PROJECT_DIR, ".cache", "nltk_data"))
 
 from ..core.audio import normalize_audio  # noqa: E402
-from ..core.backend import BackendNotInstalledError  # noqa: E402
+from ..core.backend import BackendNotInstalledError, TTSBackend  # noqa: E402
 
 
-class MeloBackend:
+class MeloBackend(TTSBackend):
     name = "melo"
     sr = 44100
 

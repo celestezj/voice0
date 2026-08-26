@@ -63,7 +63,7 @@ _pin_transformers()
 
 import numpy as np  # noqa: E402
 
-from ..core.backend import BackendNotInstalledError  # noqa: E402
+from ..core.backend import BackendNotInstalledError, TTSBackend  # noqa: E402
 
 # 权重缓存/镜像：与 tts/melo/backend.py 同套 env 前置
 os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_DIR, ".cache", "hf"))
@@ -156,7 +156,7 @@ def _wrap_max_ratio(llm, ratio):
     llm.inference = _capped
 
 
-class CosyBackend:
+class CosyBackend(TTSBackend):
     name = "cosy"
     sr = 24000
 
@@ -198,7 +198,8 @@ class CosyBackend:
 
     # ---------------- 音色 ----------------
     def _setup_voice(self):
-        v = self._voice
+        # voice=None（引擎默认）视同 "default"；后端 __init__ 默认值即 "default"
+        v = self._voice or "default"
         if v == "default":
             if not os.path.exists(_DEFAULT_PROMPT_WAV):
                 raise RuntimeError("内置参考音频缺失: %s（git 拉全或重新 clone 后重试）"

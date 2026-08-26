@@ -7,6 +7,7 @@
 `BackendNotInstalledError`（带安装提示），而不是在 import 期炸掉整个引擎。
 """
 import importlib
+from abc import ABC, abstractmethod
 
 # 后端模块与类名约定：tts/<name>/backend.py 的 <Name>Backend
 _BACKEND_MODULES = {
@@ -19,16 +20,22 @@ class BackendNotInstalledError(RuntimeError):
     """对应后端依赖未安装 / 加载失败。携带安装提示。"""
 
 
-class TTSBackend:
-    """引擎消费的统一接口。引擎只认这几个能力，其余差异全在后端内部。"""
+class TTSBackend(ABC):
+    """引擎消费的统一接口（抽象基类）。引擎只认这几个能力，其余差异全在后端内部。
+
+    melo/cosy 后端继承本类，须实现四个 @abstractmethod（name/sr 为类属性）。
+    未实现完的类无法实例化（ABC 提前报错），从"文档型协议"变为编译期契约。
+    """
 
     name = ""
     sr = 44100                     # 采样率：引擎全用 self._sr 派生，后端定死即可
 
+    @abstractmethod
     def load(self):
         """惰性 import 模型并初始化。失败抛 BackendNotInstalledError。"""
         raise NotImplementedError
 
+    @abstractmethod
     def synth_stream(self, text, *, speed=1.0, normalize=None):
         """整句流式合成，逐块产出 float32 numpy（块时长由后端定，~1s 量级）。
 
@@ -36,10 +43,12 @@ class TTSBackend:
         """
         raise NotImplementedError
 
+    @abstractmethod
     def synth(self, text, *, speed=1.0, normalize=None):
         """整句一次合成，返回完整数组（melo 原生；cosy 内部聚合 stream）。"""
         raise NotImplementedError
 
+    @abstractmethod
     def close(self):
         """释放模型/会话。引擎 close() 时调用。"""
         raise NotImplementedError
