@@ -58,9 +58,13 @@ git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git third_party/C
 
 # 2. 推理期不需要训练框架。绕开 hydra/lightning（见第 7 节 patches），
 #    只补真正缺的推理依赖：
-pip install conformer==0.3.2 diffusers==0.29.0 pyarrow pyworld soundfile
+pip install conformer==0.3.2 diffusers==0.29.0 pyarrow pyworld soundfile \
+    modelscope==1.20.0 onnxruntime==1.18.0 wetext==0.0.4
 #    cosyvoice.dataset.processor import pyarrow；flow 的 decoder 用 conformer；
-#    diffusers 是 flow 里 scheduler 依赖；soundfile 替代 torchaudio 读 wav。
+#    diffusers 是 flow 里 scheduler 依赖；soundfile 替代 torchaudio 读 wav；
+#    modelscope 是 preload_cosy.py 拉 wetext FST 用；onnxruntime 是
+#    campplus/speech_tokenizer 前端用（win32 装 CPU 版即可，backend 会强制
+#    CPU provider）；wetext 是中文文本前端（数字/单位归一化）。
 
 # 3. 预下载权重（HF 官方镜像 → .cache/hf；另拉 wetext 文本前端 FST）
 python preload_cosy.py
@@ -82,7 +86,7 @@ python bench/bench_cosy.py --device cuda --profile
 | diffusers | 0.29.0 | flow scheduler 依赖 |
 | pyarrow / pyworld | 最新 | dataset.processor / 音高特征 |
 | soundfile | 最新 | 替代 torchaudio IO（patch ③） |
-| onnxruntime | GPU 版已装 | campplus / speech_tokenizer 前端推理 |
+| onnxruntime | 1.18.0（CPU 版即可） | campplus / speech_tokenizer 前端推理；backend 强制 CPU provider，CPU 版足够 |
 | **transformers（cosy 专用，vendored）** | **4.51.3** | `.cache/pinned_transformers`（`setup_cosy_pinned.py` 落盘，**不是** main env 的 4.57.6；4.57.6 会产出杂音，issue #1546） |
 | **tokenizers（cosy 专用，vendored）** | **0.21.1** | 随 transformers pin 一并落盘（4.51.3 要求 `>=0.21,<0.22`） |
 

@@ -350,6 +350,10 @@ voice0/
 
 ### 从零复现步骤（新设备推荐，可整段复制）
 
+> **新用户最快路径**：`python setup_env.py`（或双击 `setup_env.bat`）——一键安装脚本，
+> 自动检测显卡装匹配的 torch、装 melo、可选 cosy，幂等可重跑，结尾自动端到端验证。
+> 想手动逐步安装，照下面这段即可。
+
 ```bash
 # 0. 前提：已安装 conda（miniconda 即可）、git
 
