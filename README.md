@@ -41,6 +41,11 @@ MeloTTS（VITS）无原生流式接口——`tts_to_file()` 整句合成完才�
 - **TTFA** = 首帧写进声卡时刻 − `speak()` 入口时刻。
 - 队列限长 = 吞吐 vs 延迟的折中（防延迟膨胀）。
 
+> **流式分两层**（melo 与 cosy 的差异都在这里）：
+> - **引擎层（句子级）**：两个后端都有——逐句合成、逐句入队、逐句播放，句间无缝衔接（本节的"模拟流式"即此层）。
+> - **后端层（句内块级）**：melo **无**（`synth_stream` = 整句一块，VITS 无原生流式接口）；cosy **有但默认关**（`stream=False` 整句一次解码、单块产出、句内无缝；`stream=True` 可切原生 token 级逐块，首包更快但本机 RTF>1 会块间饿死，不推荐）。
+> 相应 TTFA 口径：melo 首块即整句（<1s 达标）；cosy 默认"首包 = 整句合成耗时"（~5.6s），`stream=True` 才降到首 token 粒度。
+
 ### 插桩开关（生产零成本）
 
 | 开关 | 作用 | 生产建议 |
@@ -101,6 +106,7 @@ submit(text) → Job(gen, sentences…) ─> _jobs 队列(无界)
 - **`queue`（默认）**：新文本排到当前文本之后，按序播完再说。
 - **`bargein`**：`submit()` 在 `_submit_lock` 内先 `_do_interrupt()` 再入队——新文本**自动打断**当前播放与清空旧排队（等价手动 `interrupt()` + 入队）。
 - 切换示例：`tts.mode = "bargein"`。
+- **切换 mode 本身不打断任何任务**：只改变下一次 `submit()` 的行为——切到 `"bargein"` 时正在播的句子照常播完，直到下次 `submit()` 才自动打断；想立刻停，用 `interrupt()`。
 
 ### 4. 代际标记 `_gen` 与抢占机制
 
@@ -130,7 +136,7 @@ submit(text) → Job(gen, sentences…) ─> _jobs 队列(无界)
 | `submit(text, save_chunks_dir=None, save_wav=None)` | 否 | 入队立即返回 `Job`；bargein 模式自动打断；**实时场景用这个** |
 | `speak(text, save_chunks_dir=None, save_wav=None)` | 是 | = `submit().wait()`，播完返回逐句时序（bench 兼容） |
 | `job.wait()` | 是 | 阻塞到本任务播完/取消，返回 `job.timing` |
-| `interrupt()` / `stop()` | 否 | 打断当前正在说的 + 清空排队文本（`stop` 是 v1 别名） |
+| `interrupt()` / `stop()` | 否 | 打断当前正在说的 + 清空排队文本；**与 mode 无关，queue/bargein 下都立即生效**（`stop` 是 v1 别名） |
 | `speak_to_file(text, wav_path)` | 是 | 整段**非流式**落盘 WAV（独立一次推理），"只落盘不播放"用 |
 | `close()` | 否 | 销毁（线程/声卡/单例槽位）；幂等；`with`/`__del__`/atexit 兜底 |
 | `mode` / `speed` / `normalize` | — | 属性，运行期可读可写（`mode`/`normalize` 校验取值） |
