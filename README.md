@@ -287,6 +287,9 @@ v2 引擎（`RealtimeTTS`）本质是**后端无关骨架 + 一处后端专属**
 | `_gen` 代际抢占、queue/bargein 模式、interrupt/close 生命周期 | |
 | timing schema、save_wav / save_chunks_dir、profile/debug | |
 
+> 想接入第三个后端？完整步骤见 **`docs/EXTENDING-BACKENDS.md`**：接口契约 / 注册 / 两类合成模板
+> （非流式 vs 原生流式）/ 引擎对接点（含 cosy 专属硬编码）/ 权重预载 / bench 与验收纪律。
+
 ### 原生流式后端（MOSS-TTS-Nano / CosyVoice2）的适配点
 
 > 注（2026-08-26）：CosyVoice2 **保留**原生 token 级流式能力（`stream=True`），但本机 2070S fp32 下 RTF≈1.2（合成比播放慢），流式播放会块间饿死 + 拼接缝，故默认 `stream=False` 整句合成播放（见 cosy 节 ⚠️）。此节适配点对"想用流式的后端"仍成立。
