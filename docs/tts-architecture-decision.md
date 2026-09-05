@@ -23,7 +23,7 @@
 - **MOSS-TTS-Nano (0.1B, 2026-04)**：新候选。纯 CPU 原生流式、支持中文 + 音色克隆、有去 PyTorch 的 ONNX 版（~2× 快）；**2026-08-28 已实测排除——本机 RTF 1.25 非实时**（详见「MOSS-TTS-Nano 探针」节）。
 - **排除**：edge-tts / Azure / 火山等**云端**（需求明确要求离线）；纯自回归音频大模型（GPT-4o audio 类，端到端普遍 >1s）。
 
-**实施顺序**：MeloTTS 已实现并跑通测量；CosyVoice2 已实现为第二后端（详见下节 + `docs/README-cosyvoice2.md`）。MOSS-TTS-Nano 已实测排除（见下节），当前**无待办候选，维持现状**（melo 实时主力 + cosy 音质/克隆可选项）。
+**实施顺序**：MeloTTS 已实现并跑通测量；CosyVoice2 已实现为第二后端（详见下节 + `docs/README-cosyvoice2.md`）。MOSS-TTS-Nano 已实测排除（见下节）。**VITS 已作为第三后端落地（2026-09-05，参照 Alife 项目）**：804 个动漫角色多音色、TTFA~0.1s（比 melo 更快）、显存 ~0.56GB、中文按日式罗马音发音，详见 `docs/README-vits.md`。当前现状：melo 实时主力 + cosy 音质/克隆 + vits 角色多音色，均保持维护。
 
 ## CosyVoice2 第二后端（2026-08-26 完成，阶段2 目录重构 + 原生流式后端）
 

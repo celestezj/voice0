@@ -2,9 +2,10 @@
 
 离线实时中文 TTS 系统。核心指标：**单句 TTFA（首包耗时）<1s**、**离线运行**（权重缓存后零网络请求）、**声音自然**。
 
-两个后端（**选择性安装**，互不影响）：
+三个后端（**选择性安装**，互不影响）：
 - **melo**（默认，实时主力）：MeloTTS 中文女声，TTFA<1s 达标。
 - **cosy**（可选项，音质 + 3s 音色克隆）：CosyVoice2-0.5B，句首等待 ~5.6-6.2s（整句合成后播放），需 GPU。
+- **vits**（可选项，多音色）：参照 Alife 项目的 multi-speaker VITS，804 个动漫角色音色，中文按日式罗马音发音，TTFA~0.1s（比 melo 更快）、显存 ~0.56GB。
 - `sapi/` 是非神经对照基线（SAPI 机器音，非主用）。
 
 ## 快速上手（安装 → 使用）
@@ -15,6 +16,7 @@
 2. **权重预下载**（仅首次联网，之后运行期零网络）：
    - melo：`python preload_weights.py`
    - cosy（若用）：`python preload_cosy.py` + `python setup_cosy_pinned.py`（落盘 cosy 专属 transformers 4.51.3）
+   - vits（若用）：`python preload_vits.py`（GitHub release 下载 412MB → `.cache/vits/VITS/`，幂等；ghfast.top 代理优先、直连兜底）
 3. **跑起来**：`python speak_example.py` —— 交互 demo（选后端/音色/播放模式，输入文本即播报）。
 4. **代码里用**：
    ```python
@@ -49,9 +51,10 @@ tts/
 │   ├── backend.py  TTSBackend（ABC：load/synth_stream/synth/close）+ get_backend(name) 惰性加载
 │   └── audio.py    保存 WAV + normalize
 ├── melo/        MeloBackend（继承 TTSBackend）
-└── cosy/        CosyBackend（继承 TTSBackend；transformers pin / onnx / wetext 前置全在模块顶层）
-bench/           bench_melo / bench_cosy / console_gantt（bench 自动回写 README 的验收区间 + 目录树）
-docs/            tts-architecture-decision.md（选型与环境决策）+ README-cosyvoice2.md（cosy 完整文档）
+├── cosy/        CosyBackend（继承 TTSBackend；transformers pin / onnx / wetext 前置全在模块顶层）
+└── vits/        VitsBackend（继承 TTSBackend；参照 Alife，多音色 voice；推理代码随模型发布，load 时 sys.path 注入）
+bench/           bench_melo / bench_cosy / bench_vits / console_gantt（bench 自动回写 README 的验收区间 + 目录树）
+docs/            tts-architecture-decision.md（选型与环境决策）+ README-cosyvoice2.md（cosy 完整文档）+ README-vits.md（vits 完整文档）
 sapi/            synth_sapi.py（非神经基线）
 assets/          cosy 默认音色参考音频
 third_party/     克隆的上游仓库（CosyVoice + Matcha-TTS，gitignored）
@@ -61,6 +64,7 @@ third_party/     克隆的上游仓库（CosyVoice + Matcha-TTS，gitignored）
 
 - `README.md`「常驻引擎 v2」（§1-§8）= 引擎完整设计：单例机制、线程数据流、queue/bargein 模式、`_gen` 抢占、生命周期、API 参考、使用案例、线程安全坑。**改引擎代码前必读。**
 - `docs/README-cosyvoice2.md` = cosy 完整文档：安装/音色配置/API/验收实测（含 fp16 已排除结论、句间停顿为固有代价）/已知限制。
+- `docs/README-vits.md` = vits 完整文档：安装/音色配置（voice 参数：None=int=名字）/API/验收实测（vs melo 对比表）/已知限制。
 - `docs/tts-architecture-decision.md` = 选型结论与硬件环境（新设备复现以 README 为准）。
 - `docs/ai-project-methodology.md` = 本项目沉淀的 **AI 项目全流程方法论**（立案→探索→实施→测试→迭代→文档→复现，含验收纪律/探针文化/反模式清单），可复用到其他 AI 项目。
 

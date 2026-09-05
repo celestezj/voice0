@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 _BACKEND_MODULES = {
     "melo": ("tts.melo.backend", "MeloBackend"),
     "cosy": ("tts.cosy.backend", "CosyBackend"),
+    "vits": ("tts.vits.backend", "VitsBackend"),
 }
 
 

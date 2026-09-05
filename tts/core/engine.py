@@ -71,7 +71,7 @@ class RealtimeTTS:
             if inst is not None:
                 want = _resolve_device(device)
                 want_bk = (backend or "melo").lower()
-                want_voice = voice if want_bk == "cosy" else None   # voice 仅 cosy 后端有含义
+                want_voice = voice if want_bk in ("cosy", "vits") else None   # voice 仅 cosy/vits 有含义
                 want_ratio = max_speech_ratio if want_bk == "cosy" else None
                 want_stream = bool(stream) if want_bk == "cosy" else None
                 if (want != inst._device or want_bk != inst._backend_name
@@ -102,7 +102,7 @@ class RealtimeTTS:
         try:
             self._device = _resolve_device(device)
             self._backend_name = (backend or "melo").lower()
-            self._voice = voice if self._backend_name == "cosy" else None
+            self._voice = voice if self._backend_name in ("cosy", "vits") else None
             # cosy 后端 LLM 生成长度有随机性（transformers 修复后已基本解决，见
             # docs/README-cosyvoice2.md §8），max_speech_ratio 把单句生成 token 上限
             # 从默认 20×text 收紧（None=模型默认），作为可选安全阀。
@@ -132,8 +132,9 @@ class RealtimeTTS:
 
             t0 = time.perf_counter()
             backend_cfg = {}
-            if self._backend_name == "cosy":
+            if self._backend_name in ("cosy", "vits"):
                 backend_cfg["voice"] = self._voice
+            if self._backend_name == "cosy":
                 if self._max_speech_ratio is not None:
                     backend_cfg["max_speech_ratio"] = self._max_speech_ratio
                 if self._stream is not None:

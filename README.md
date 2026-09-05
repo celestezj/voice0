@@ -2,7 +2,7 @@
 
 把文本实时转换为自然语音的程序，核心指标：**单句 TTFA（首包耗时）< 1s**、**离线运行**（权重缓存后零网络请求）、**声音自然**（非 SAPI 机器音）。
 
-当前实现：**MeloTTS**（实时主力，TTFA<1s 达标）+ **CosyVoice2-0.5B**（可选项：音质 + 3s 音色克隆，见 `docs/README-cosyvoice2.md`）。两者经后端抽象独立选择安装，melo 为句子级分块流式，cosy 默认整句合成播放（句内无缝，可切原生 token 级流式）。
+当前实现：**MeloTTS**（实时主力，TTFA<1s 达标）+ **CosyVoice2-0.5B**（可选项：音质 + 3s 音色克隆，见 `docs/README-cosyvoice2.md`）+ **VITS**（可选项：804 个动漫角色多音色，见 `docs/README-vits.md`）。三者经后端抽象独立选择安装：melo 句子级分块流式；cosy 默认整句合成播放（句内无缝，可切原生 token 级流式）；vits 非流式整句一块但单次前向极快（TTFA~0.1s，全面快于 melo）。
 
 ---
 
@@ -25,7 +25,7 @@
 
 **结论**：MeloTTS 为首选（CPU 实时、离线、简单、中文较自然）；音质上限为 CosyVoice2（需 GPU 常驻）。排除所有云端方案（用户明确要求离线）。**实施顺序：先 MeloTTS，跑通测量后再试下一个。**
 
-> **现状**：MeloTTS 已落地（验收达标）；**CosyVoice2-0.5B 已作为第二后端接入**（2026-08-26，可选项、选择性安装）——提供 melo 没有的"音质上限 + 任意 3s 参考音频克隆"，代价是句首等待 ~5.6-6.2s（整句合成后播放）、需 GPU、且 0.5B 的 LLM 生成长度有随机性（详见下节与 `docs/README-cosyvoice2.md`）。实时 <1s 硬指标仍由 melo 承担。⚠️ 接入初期曾因 main env 的 transformers 4.57.6 与 CosyVoice2 不兼容（官方 [issue #1546](https://github.com/FunAudioLLM/CosyVoice/issues/1546)）产出杂音，已用 vendored transformers 4.51.3 修复（见下节）。
+> **现状**：MeloTTS 已落地（验收达标）；**CosyVoice2-0.5B 已作为第二后端接入**（2026-08-26，可选项、选择性安装）——提供 melo 没有的"音质上限 + 任意 3s 参考音频克隆"，代价是句首等待 ~5.6-6.2s（整句合成后播放）、需 GPU、且 0.5B 的 LLM 生成长度有随机性（详见下节与 `docs/README-cosyvoice2.md`）。实时 <1s 硬指标仍由 melo 承担。⚠️ 接入初期曾因 main env 的 transformers 4.57.6 与 CosyVoice2 不兼容（官方 [issue #1546](https://github.com/FunAudioLLM/CosyVoice/issues/1546)）产出杂音，已用 vendored transformers 4.51.3 修复（见下节）。**2026-09-05 新增第三后端 VITS**（参照 Alife 项目）：804 个动漫角色音色、TTFA~0.1s（比 melo 更快）、显存 ~0.56GB，中文按日式罗马音发音（详见下节与 `docs/README-vits.md`）。
 
 ---
 
@@ -57,7 +57,7 @@ MeloTTS（VITS）无原生流式接口——`tts_to_file()` 整句合成完才�
 
 ## 常驻引擎 v2（单例 · 常驻线程 · 完整生命周期）
 
-> 实现：`tts/core/engine.py` 的 `RealtimeTTS` / `jobs.py` 的 `Job`。本文档是**完整设计说明**，供后续接手的 AI 快速上手——代码、语义、边界、坑全部对齐当前实现。引擎为后端无关骨架：`backend` 参数切换 melo/cosy，差异全在后端模块（`tts/melo/backend.py` / `tts/cosy/backend.py`）。
+> 实现：`tts/core/engine.py` 的 `RealtimeTTS` / `jobs.py` 的 `Job`。本文档是**完整设计说明**，供后续接手的 AI 快速上手——代码、语义、边界、坑全部对齐当前实现。引擎为后端无关骨架：`backend` 参数切换 melo/cosy/vits，差异全在后端模块（`tts/melo/backend.py` / `tts/cosy/backend.py` / `tts/vits/backend.py`）。
 
 **背景**：实时场景下文本到达时机不可预测。v1 每次调用都"建对象 → 加载模型 → 建线程 → 用完释放"，反复初始化开销大。v2 用三根支柱解决：**单例**（模型只加载一次）、**常驻线程**（合成/播放线程只创建一次）、**代际标记 `_gen`**（新文本随时可抢占或排队）。
 
@@ -132,7 +132,7 @@ submit(text) → Job(gen, sentences…) ─> _jobs 队列(无界)
 
 | 方法 / 属性 | 阻塞？ | 说明 |
 |---|---|---|
-| `RealtimeTTS(device="auto", speed=None, mode=None, normalize=None, backend="melo", voice=None, profile=False, debug=False, max_speech_ratio=None, stream=None)` | 构造 | 单例；device/backend/voice/max_speech_ratio/stream 变更销毁重建，mode/speed/normalize 原地切换，profile/debug 仅首次生效。`backend`：melo（默认）/ cosy；`voice` 仅 cosy：`"default"` 或 `"clone:<wav>:<文本>"`；`max_speech_ratio` 仅 cosy：收紧 LLM 生成上限（None=模型默认）；`stream` 仅 cosy：`False`=整句合成后播放（默认，句内无缝）/ `True`=原生 token 级流式（本机 2070S 会卡顿，不推荐） |
+| `RealtimeTTS(device="auto", speed=None, mode=None, normalize=None, backend="melo", voice=None, profile=False, debug=False, max_speech_ratio=None, stream=None)` | 构造 | 单例；device/backend/voice/max_speech_ratio/stream 变更销毁重建，mode/speed/normalize 原地切换，profile/debug 仅首次生效。`backend`：melo（默认）/ cosy / vits；`voice` 仅 cosy/vits：cosy 用 `"default"`/`"clone:<wav>:<文本>"`，vits 用 speaker_id（0~803）或音色名（None=551 派蒙）；`max_speech_ratio` 仅 cosy：收紧 LLM 生成上限（None=模型默认）；`stream` 仅 cosy：`False`=整句合成后播放（默认，句内无缝）/ `True`=原生 token 级流式（本机 2070S 会卡顿，不推荐） |
 | `submit(text, save_chunks_dir=None, save_wav=None)` | 否 | 入队立即返回 `Job`；bargein 模式自动打断；**实时场景用这个** |
 | `speak(text, save_chunks_dir=None, save_wav=None)` | 是 | = `submit().wait()`，播完返回逐句时序（bench 兼容） |
 | `job.wait()` | 是 | 阻塞到本任务播完/取消，返回 `job.timing` |
@@ -270,11 +270,12 @@ assert job.wait() == []              # wait() 直接返回空列表
 
 ### 现状
 
-- **后端抽象落地**：`tts/core/backend.py` 定义 `TTSBackend` 协议（`name`/`sr`/`load`/`synth_stream`/`synth`/`close`）+ `get_backend(name)` 惰性 import。`tts/core` 只依赖 numpy+sounddevice，**零后端 import**；melo/cosy 模块全惰性加载，缺失依赖时抛 `BackendNotInstalledError` 带安装提示——这是**选择性安装**（melotts-only / cosyvoice2-only / both）的根基。
+- **后端抽象落地**：`tts/core/backend.py` 定义 `TTSBackend` 协议（`name`/`sr`/`load`/`synth_stream`/`synth`/`close`）+ `get_backend(name)` 惰性 import。`tts/core` 只依赖 numpy+sounddevice，**零后端 import**；melo/cosy/vits 模块全惰性加载，缺失依赖时抛 `BackendNotInstalledError` 带安装提示——这是**选择性安装**（melotts-only / cosyvoice2-only / vits-only / 任意组合）的根基。
 - **melo**：`tts/melo/backend.py`，`synth_stream` = `iter([synth(text)])`（整句一次，行为与重构前一致）。
 - **cosy**：`tts/cosy/backend.py`，`synth_stream` 默认 `inference_zero_shot(stream=False)` **整句一次解码、单块产出**（本机 fp32 RTF>1，原生流式会块间饿死；`stream=True` 可切回 token 级逐块）。见 `docs/README-cosyvoice2.md`。
+- **vits**：`tts/vits/backend.py`（参照 Alife 项目），`synth_stream` = `iter([synth(text)])` 整句一块同 melo；**多音色** = 换 `sid`（`voice`：None=551 派蒙 / int=speaker_id / str=名字反查，804 个）。见 `docs/README-vits.md`。
 - `synth_sapi.py`（`sapi/synth_sapi.py`）仍是**非神经对照基线**，与神经链路零代码耦合。
-- bench 按后端拆：`bench/bench_melo.py` / `bench/bench_cosy.py`，共享 `bench/console_gantt.py`。
+- bench 按后端拆：`bench/bench_melo.py` / `bench/bench_cosy.py` / `bench/bench_vits.py`，共享 `bench/console_gantt.py`。
 
 ### 已验证：v2 引擎的可复用边界
 
@@ -282,12 +283,12 @@ v2 引擎（`RealtimeTTS`）本质是**后端无关骨架 + 一处后端专属**
 
 | 后端无关（换方案可原样复用） | 后端专属（须替换） |
 |---|---|
-| `Job`（wait / mark_done / canceled / timing） | **`synth_stream(text) -> 逐块生成器`**（melo=整句一块；cosy=默认整句一块，`stream=True` 切原生逐块） |
+| `Job`（wait / mark_done / canceled / timing） | **`synth_stream(text) -> 逐块生成器`**（melo/vits=整句一块；cosy=默认整句一块，`stream=True` 切原生逐块） |
 | 常驻合成/播放双线程、`_jobs` + `_audio_q`（背压） | timing 口径微调（见下） |
 | `_gen` 代际抢占、queue/bargein 模式、interrupt/close 生命周期 | |
 | timing schema、save_wav / save_chunks_dir、profile/debug | |
 
-> 想接入第三个后端？完整步骤见 **`docs/EXTENDING-BACKENDS.md`**：接口契约 / 注册 / 两类合成模板
+> 想接入新后端？完整步骤见 **`docs/EXTENDING-BACKENDS.md`**：接口契约 / 注册 / 两类合成模板
 > （非流式 vs 原生流式）/ 引擎对接点（含 cosy 专属硬编码）/ 权重预载 / bench 与验收纪律。
 
 ### 原生流式后端（MOSS-TTS-Nano / CosyVoice2）的适配点
@@ -317,10 +318,11 @@ voice0/
 ├── tts/
 │   ├── core/          # 后端无关骨架：engine/jobs/audio/backend（自 tts_melo.py 抽出，git mv 保历史）
 │   ├── melo/          # Melo 后端（整句 synth）
-│   └── cosy/          # CosyVoice2 后端（默认整句合成播放，可切原生流式）
+│   ├── cosy/          # CosyVoice2 后端（默认整句合成播放，可切原生流式）
+│   └── vits/          # VITS 多音色后端（804 动漫角色，整句 synth）
 ├── sapi/              # 非神经对照基线（synth_sapi.py）
-├── bench/             # bench_melo / bench_cosy / console_gantt
-├── docs/              # tts-architecture-decision.md + README-cosyvoice2.md
+├── bench/             # bench_melo / bench_cosy / bench_vits / console_gantt
+├── docs/              # tts-architecture-decision.md + README-cosyvoice2.md + README-vits.md
 └── README.md
 ```
 
@@ -402,6 +404,8 @@ python bench/bench_melo.py --device cuda
 > `docs/README-cosyvoice2.md` 单独安装（`third_party/` clone + 依赖 + `preload_cosy.py`
 > + `setup_cosy_pinned.py` 落盘 cosy 专属 transformers 4.51.3），
 > 两引擎相互独立、可只装其一，`bench/bench_cosy.py --device cuda` 验收。
+> 若要 VITS 第三后端（804 动漫多音色），`python preload_vits.py` 一次下载即可
+> （无 pip 重依赖），`bench/bench_vits.py --device cuda` 验收，详见 `docs/README-vits.md`。
 
 **预期结果对照**（应达到的 TTFA，单位秒）：
 
@@ -427,8 +431,8 @@ python bench/bench_melo.py --device all --profile --debug
 1. **setuptools ≥ 81 会让 jieba 崩**（`pkg_resources` 被移除）→ 必须 `pip install setuptools==80.9.0`。
 2. **克隆大环境带的 jax/jaxlib/ml_dtypes 与 numpy 2.2.6 不兼容**，会在 import transformers 时崩 → 卸载 `pip uninstall -y jax jaxlib ml_dtypes`（仅克隆路径需处理）。
 3. **huggingface.co / raw.githubusercontent 在本机被墙/极慢** → 脚本已内置 `HF_ENDPOINT=hf-mirror.com` 与 `ghfast.top` 代理，首次下载自动走镜像。
-4. **权重缓存必须落在项目内**：`tts/melo/backend.py` / `tts/cosy/backend.py` 在 import 期就把 `HF_HOME`/`NLTK_DATA` 重定向到 `.cache/`，不要手动改。
-5. **换设备 `.cache/` 不会随 git 过来**（已 gitignore）——重装环境后跑一次 `preload_weights.py`（melo）/ `preload_cosy.py`（cosy）即可自动重建，无需手动拷贝。
+4. **权重缓存必须落在项目内**：`tts/melo/backend.py` / `tts/cosy/backend.py` 在 import 期就把 `HF_HOME`/`NLTK_DATA` 重定向到 `.cache/`（vits 无 HF 依赖，权重在 `.cache/vits/`），不要手动改。
+5. **换设备 `.cache/` 不会随 git 过来**（已 gitignore）——重装环境后跑一次 `preload_weights.py`（melo）/ `preload_cosy.py`（cosy）/ `preload_vits.py`（vits）即可自动重建，无需手动拷贝。
 6. **`import melo` 用的是 editable 源码**（`.cache/MeloTTS`）：删掉该目录会导致 import 失败，需要重跑步骤 3 方式A。
 
 ### 产出说明
@@ -501,9 +505,9 @@ array([-0.0012, -0.0008, 0.0031, ..., 0.0005], dtype=float32)
 
 | 用例 | 句数 | 首句TTFA(s) | 平均合成(ms/句) | 最大等待(ms) | 总跨度(s) |
 |---|---|---|---|---|---|
-| 短 | 2 | 0.159 | 152 | 1782 | 4.13 |
-| 中 | 3 | 0.143 | 152 | 3788 | 6.45 |
-| 长 | 3 | 0.326 | 304 | 10057 | 15.29 |
+| 短 | 2 | 0.172 | 163 | 1528 | 3.79 |
+| 中 | 3 | 0.150 | 154 | 3750 | 6.37 |
+| 长 | 3 | 0.365 | 337 | 9919 | 15.22 |
 
 - 交互式时序图（悬停看明细）: `reports/bench_timing_cuda.html`
 - 逐句原始指标: `audio/bench_report_cuda.txt`
@@ -512,14 +516,14 @@ array([-0.0012, -0.0008, 0.0031, ..., 0.0005], dtype=float32)
 
 | 指标 | CPU | GPU |
 |---|---|---|
-| 首句 TTFA | 0.927s | 0.159s |
+| 首句 TTFA | 0.927s | 0.172s |
 | TTFA 达标(<1s) | ✅ | ✅ |
-| GPU 相对 CPU 提速 | — | 5.8× |
+| GPU 相对 CPU 提速 | — | 5.4× |
 | GPU 峰值显存 | — | 1.088 GB |
 
-**结论**：GPU 首句 TTFA=0.159s 达标<1s；CPU 首句 TTFA=0.927s 达标<1s。流式重叠已验证：播放段与下一句合成段重叠。
+**结论**：GPU 首句 TTFA=0.172s 达标<1s；CPU 首句 TTFA=0.927s 达标<1s。流式重叠已验证：播放段与下一句合成段重叠。
 
-> 生成时间：2026-08-26 09:20:44（每次 bench 运行自动刷新）
+> 生成时间：2026-09-05 22:14:23（每次 bench 运行自动刷新）
 <!-- bench:end -->
 
 ---
@@ -555,6 +559,34 @@ tts.speak_to_file("要生成的文本。", "audio/cosy_out.wav")                
 
 ---
 
+## VITS（第三后端，多音色，可选项）
+
+> 完整安装/音色配置/已知限制见 **[`docs/README-vits.md`](docs/README-vits.md)**。本节只放结论。
+
+**定位**：参照 Alife 项目（github.com/BDFFZI/Alife）的 multi-speaker VITS 接入。提供前两后端没有的 **804 个动漫角色音色**（赛马娘 umamusume / 派蒙 / 原神角色等），中文按**日式罗马音**发音（`zh_ja_mixture_cleaners` 把中文转成 romaji 标注，日系动漫腔，属设计如此）。非流式整句一块，但单次前向极快：**TTFA ~0.1s（全面快于 melo）**、峰值显存 ~0.56GB。
+
+**用法**：
+```python
+tts = RealtimeTTS(device="cuda", backend="vits")                    # 默认 551=派蒙
+tts = RealtimeTTS(device="cuda", backend="vits", voice=0)           # speaker_id（0~803）
+tts = RealtimeTTS(device="cuda", backend="vits", voice="黄金船")    # 按名字反查
+tts.speak_to_file("要生成的文本。", "audio/vits_out.wav")
+```
+
+**安装**：`python preload_vits.py`（GitHub release 下载 412MB → `.cache/vits/VITS/`，幂等，无 pip 重依赖）。权重全在项目 `.cache/`，运行期零网络。
+
+**验收实测**（RTX 2070 SUPER 8GB，`bench_vits.py --device cuda --profile`，与 melo 同文本对比）：
+
+| 用例 | vits TTFA | melo TTFA | 峰值显存 |
+|---|---|---|---|
+| 短（2 句） | 0.09–0.13s | 0.17s | 0.56 GB |
+| 中（3 句） | 0.10–0.12s | 0.15s | 0.56 GB |
+| 长（3 句） | 0.14–0.16s | 0.37s | 0.56 GB |
+
+3 音色（派蒙/特别周/黄金船）TTFA 与显存几乎一致（换音色零额外成本）；Whisper/funasr 转写多音色多句内容全部正确。实时 <1s 达标，且 vits 全面快于 melo——若要最快响应 + 角色音色，选 vits。
+
+---
+
 ## 目录树
 
 <!-- tree:start -->
@@ -567,9 +599,12 @@ voice0/
 │   ├── __init__.py
 │   ├── bench_cosy.py
 │   ├── bench_melo.py
+│   ├── bench_vits.py
 │   └── console_gantt.py
 ├── docs/
+│   ├── EXTENDING-BACKENDS.md
 │   ├── README-cosyvoice2.md
+│   ├── ai-project-methodology.md
 │   └── tts-architecture-decision.md
 ├── reports/
 │   ├── bench_timing_cpu.html
@@ -591,12 +626,20 @@ voice0/
 │   ├── melo/
 │   │   ├── __init__.py
 │   │   └── backend.py
+│   ├── vits/
+│   │   ├── __init__.py
+│   │   └── backend.py
 │   └── __init__.py
 ├── .gitignore
+├── CLAUDE.md
 ├── README.md
 ├── preload_cosy.py
+├── preload_vits.py
 ├── preload_weights.py
 ├── setup_cosy_pinned.py
-└── speak_example.py
+├── setup_env.bat
+├── setup_env.py
+├── speak_example.py
+└── verify_install.py
 ```
 <!-- tree:end -->

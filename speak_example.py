@@ -45,6 +45,19 @@ def _prompt_choice(title, options, default):
 _EXITING = False   # 退出中：抑制后台线程补打的甘特图，避免盖过"已关闭"提示
 
 
+def _list_speakers(limit=20):
+    """打印 .cache/vits/VITS/speakers_list.txt 前若干音色，供 vits 选音色。"""
+    p = os.path.join(_PROJECT_DIR, ".cache", "vits", "VITS", "speakers_list.txt")
+    if not os.path.isfile(p):
+        print("（未找到 %s，请先运行 `python preload_vits.py`）" % p)
+        return
+    with open(p, "r", encoding="utf-8") as f:
+        lines = [l.strip() for l in f if l.strip()]
+    print("共 %d 个音色（前 %d 个，可输入任意名字或 ID）：" % (len(lines), limit))
+    for l in lines[:limit]:
+        print("  %s" % l)
+
+
 def _print_input_gantt(seq, job):
     """打印一次输入的甘特图（后台线程调用）。阻塞到本段播完/被打断再画。
     被打断/空分句时给兜底提示。"""
@@ -67,8 +80,18 @@ def main():
     backend = _prompt_choice("后端引擎", [
         (1, "melo", "melo （默认）MeloTTS：中文女声、TTFA<1s、实时主力"),
         (2, "cosy", "cosy  CosyVoice2：音质更佳 + 3s 音色克隆（整句合成后播放、句内无缝，需装依赖）"),
+        (3, "vits", "vits  多音色 VITS：804 个动漫角色音色（赛马娘/派蒙等），中文按日式罗马音发音"),
     ], "melo")
     voice = None
+    if backend == "vits":
+        v = _prompt_choice("vits 音色", [
+            (1, None, "默认 551=派蒙（首个运行请先 `python preload_vits.py` 下载权重）"),
+            (2, "pick", "从 804 个音色里挑一个（输入名字或 ID，回车列出前 20 个）"),
+        ], None)
+        if v == "pick":
+            _list_speakers(20)
+            s = input("输入音色名字或 ID（如 0 / 特别周 / 派蒙）> ").strip()
+            voice = s if s else None
     if backend == "cosy":
         v = _prompt_choice("cosy 音色", [
             (1, "default", "default （推荐）内置参考女声"),
@@ -109,7 +132,7 @@ def main():
         (3, "agc", "agc 句内动态压缩 + 短停压缩 + 句间对齐（推荐）"),
     ], None)
 
-    print("\n正在加载 %s（模型加载 + 预热，melo 首次约 10-30s，cosy 更久）..." % backend.upper())
+    print("\n正在加载 %s（模型加载 + 预热，melo 首次约 10-30s，cosy 更久，vits 约 3-10s）..." % backend.upper())
     tts = RealtimeTTS(device=device, backend=backend, voice=voice,
                       mode=mode, normalize=normalize, profile=True,
                       max_speech_ratio=max_speech_ratio, stream=stream)

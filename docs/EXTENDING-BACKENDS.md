@@ -1,11 +1,12 @@
-# 扩展新后端指南（melo / cosy 之外）
+# 扩展新后端指南（melo / cosy / vits 之外）
 
-> 面向「将来接入第三个 TTS 后端」（如 GPT-SoVITS、edge-tts 等）的
+> 面向「将来接入新 TTS 后端」（如 GPT-SoVITS、edge-tts 等）的
 > **实操步骤手册**。回答三个问题：后端长什么样、引擎怎么调它、新后端要改哪几处。
 >
 > 关联文档（动手前按需精读）：
 > - `README.md`「常驻引擎 v2」（§1-§8）= 引擎完整设计，**引擎语义以它为准**。
 > - `docs/README-cosyvoice2.md` = cosy 接入的最全参考实现（含上游补丁）。
+> - `docs/README-vits.md` = vits 接入参考（多音色 + URL 权重下载，无 HF 依赖）。
 > - `docs/tts-architecture-decision.md` = 选型背景（为什么是 melo + cosy）；**「MOSS-TTS-Nano 探针」节 = 一个已实测排除的候选**（RTF 1.25 非实时、fp16/nq=8 无效、流式饿死），写新后端前先看，省得重复踩。
 
 ---
@@ -27,7 +28,7 @@ RealtimeTTS（tts/core/engine.py，后端无关骨架）
 
 **两层流式先分清**（避免接口理解错位，详见 README「流式架构」节）：
 - **引擎层（句子级）**：任何后端都流式——引擎按句分块、逐句合成、逐句播放、句间无缝。后端不用管。
-- **后端层（句内块级）**：可选能力。整句一块（melo）或逐 token 块（cosy `stream=True`）。决定 `synth_stream` 怎么 yield。
+- **后端层（句内块级）**：可选能力。整句一块（melo/vits）或逐 token 块（cosy `stream=True`）。决定 `synth_stream` 怎么 yield。
 
 ---
 
@@ -130,6 +131,7 @@ class FooBackend(TTSBackend):
 _BACKEND_MODULES = {
     "melo": ("tts.melo.backend", "MeloBackend"),
     "cosy": ("tts.cosy.backend", "CosyBackend"),
+    "vits": ("tts.vits.backend", "VitsBackend"),
     "foo":  ("tts.foo.backend",  "FooBackend"),      # ← 加这一行
 }
 ```
@@ -141,7 +143,7 @@ _BACKEND_MODULES = {
 
 ## 5. 合成实现：两类模板
 
-### A. 非流式（melo 型）—— 无块级流式能力
+### A. 非流式（melo/vits 型）—— 无块级流式能力
 
 ```python
 def synth_stream(self, text, *, speed=1.0, normalize=None):
@@ -183,7 +185,7 @@ def synth(self, text, *, speed=1.0, normalize=None):
 
 ---
 
-## 6. 环境前置与上游补丁（melo/cosy 同套模式）
+## 6. 环境前置与上游补丁（melo/cosy 同套模式；vits 是例外）
 
 **路径重定向**（必须在 `import` 任何模型库之前）——`tts/core/backend.py` 已设过的不重复设：
 
@@ -196,6 +198,11 @@ os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(_PROJECT_DIR, ".cache", "
 > **铁律：所有下载资源必须重定向进项目 `.cache/`**，绝不落主目录（`~/.cache/...`）。cosy 曾漏了
 > modelscope 的 wetext FST（落 `~/.cache/modelscope`），已修。新后端凡有下载，先在模块顶层列全
 > env 前置并核对落点。
+>
+> **vits 是例外**：无 HF/modelscope 依赖，权重走 GitHub release URL（`preload_vits.py`，
+> ghfast.top 代理优先 + 直连兜底）落 `.cache/vits/`，不设任何 HF 环境变量；推理代码随模型
+> 发布（`models.py/text/commons/utils/monotonic_align`），`load()` 里 `sys.path.insert` 后顶层
+> import——不装额外 pip 包（jieba/pypinyin/cn2an/Unidecode 环境已有）。
 
 **transformers pin（仅 cosy 需要）**：cosy 因上游 issue #1546 必须 `transformers==4.51.3`，
 用 `setup_cosy_pinned.py` 落盘 vendored 副本 + 模块顶层注入 `sys.path`。**新后端若对 transformers
