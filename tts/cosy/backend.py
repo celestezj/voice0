@@ -28,6 +28,18 @@ import sys
 # 本文件位于 tts/cosy/backend.py → 项目根向上取 3 级
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ---- 权重缓存/镜像 env 前置：必须最先、先于任何 import（含 _pin_transformers）----
+# 血泪坑（2026-09-05）：huggingface_hub 的缓存路径在 import 时按当时 env 冻结。
+# 若先 import 了 transformers（其内部依赖 hf_hub），HF_HUB_CACHE 会按"未设 HF_HOME"
+# 的状态落到主目录 ~/.cache/huggingface/hub——而项目 .cache/hf 已有字节一致副本，
+# 于是 cosy 每次重新下载 4.6G 且落在主目录（违反铁律）。故本组 setdefault 必须在
+# transformers pin / 任何模型库 import 之前执行。setdefault 不覆盖用户显式配置。
+os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_DIR, ".cache", "hf"))
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+# modelscope 缓存（wetext 文本前端 FST 走这里）默认落在 ~/.cache/modelscope，
+# 同样收进项目内 .cache/ —— 与 HF_HOME 同规矩：所有下载资源都归项目管。
+os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(_PROJECT_DIR, ".cache", "modelscope"))
+
 # ---- transformers pin：须最先、在任何 import transformers 之前生效 ----
 # CosyVoice2 官方 issue #1546：transformers 高于 4.51.3 就出问题（4.53+ 重写了
 # Qwen2Model.forward 的 attention-mask / hidden-state 输出逻辑，Qwen2LM 调用路径
@@ -65,13 +77,6 @@ _pin_transformers()
 import numpy as np  # noqa: E402
 
 from ..core.backend import BackendNotInstalledError, TTSBackend  # noqa: E402
-
-# 权重缓存/镜像：与 tts/melo/backend.py 同套 env 前置
-os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_DIR, ".cache", "hf"))
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-# modelscope 缓存（wetext 文本前端 FST 走这里）默认落在 ~/.cache/modelscope，
-# 同样收进项目内 .cache/ —— 与 HF_HOME 同规矩：所有下载资源都归项目管。
-os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(_PROJECT_DIR, ".cache", "modelscope"))
 
 # CosyVoice 仓库与其 Matcha-TTS 子模块（PYTHONPATH 注入，须在 import cosyvoice 之前）
 _THIRD_PARTY = os.path.join(_PROJECT_DIR, "third_party", "CosyVoice")
