@@ -267,7 +267,7 @@ CosyVoice2 bench: device=cuda（bench/bench_cosy.py --device cuda，非流式播
 另有三处 backend 内注入（`tts/cosy/backend.py`，非文件补丁）：
 
 - **`_force_cpu_onnx()`**：campplus/speech_tokenizer 是小模型，CPU 推理 ms 级——frontend 会按 `torch.cuda.is_available()` 请求 CUDAExecutionProvider，CPU 版 onnxruntime 没有该 provider 会崩。全局把 `ort.InferenceSession` providers 强制回 CPU。
-- **`_ensure_wetext_local()`**：`wetext.Normalizer` 每次构造都调 modelscope `snapshot_download` 查 metadata，撞限流 403 会整个降级为"无文本前端"（数字不归一）。若 `~/.cache/modelscope/models/pengzhendong--wetext` 已有 FST 缓存，直接注入本地路径，零联网。
+- **`_ensure_wetext_local()`**：`wetext.Normalizer` 每次构造都调 modelscope `snapshot_download` 查 metadata，撞限流 403 会整个降级为"无文本前端"（数字不归一）。若 `.cache/modelscope/models/pengzhendong--wetext` 已有 FST 缓存，直接注入本地路径，零联网（缓存位置已随 `MODELSCOPE_CACHE` 重定向进项目内，见 backend 顶层 env 前置）。
 - **`_silence_tqdm()`**：仓库在推理链硬编码 `tqdm(...)`，流式会刷进度条，替换为透传。
 
 ---

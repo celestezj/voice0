@@ -11,7 +11,7 @@
 ## 硬件与开发环境
 
 - GPU：**RTX 2070 SUPER 8GB**（Turing sm_75），NVIDIA 驱动 591.86 / CUDA 13.1，总显存 8.59GB。
-- conda 环境 `voice-tts`（**开发机**位于 D:\anaconda\envs\voice-tts，**克隆自 python3.10**，含 torch 2.11.0+cu126）——本项目专用；克隆是为了不污染 yolo-gpu 正在用的 python3.10。其他设备不依赖此路径，按 README 从零复现同名环境即可。注：项目建立伊始，在创建虚拟环境时建议AI直接拷贝了已有的深度学习项目（yolo）的环境
+- conda 环境 `voice-tts`（**开发机** conda 位置用 `conda info --base` 动态获取——本机为 `D:\anaconda`，即环境在 `D:\anaconda\envs\voice-tts`；**克隆自 python3.10**，含 torch 2.11.0+cu126）——本项目专用；克隆是为了不污染 yolo-gpu 正在用的 python3.10。**其他设备不依赖此路径**（代码与脚本零硬编码盘符），按 README 从零复现同名环境即可。注：项目建立伊始，在创建虚拟环境时建议AI直接拷贝了已有的深度学习项目（yolo）的环境
 - **新设备从零复现以 README「环境与复现（新设备一键复现）」为准**（含实测锁定版本表、conda 步骤、常见坑）。
 - 本机网络：huggingface.co / raw.githubusercontent.com 直连被墙或极慢；**hf-mirror.com 与 ghfast.top 代理可用**（仅首次下载权重用）。
 - 环境修正（仅克隆大环境路径会遇到）：卸载克隆自带的 jax/jaxlib/ml_dtypes（与 numpy 2.2.6 不兼容，会崩 transformers）；setuptools 固定 80.9.0（81+ 移除 pkg_resources，jieba 需要）。
@@ -20,10 +20,10 @@
 
 - **MeloTTS**：首选（**已实现，实时主力**）。CPU 原生实时、MIT、模型 ~60–100MB、离线、中文"较自然"，无音色克隆、表现力有限。GPU 更快。单句 TTFA <1s 硬指标达标。
 - **CosyVoice2 (0.5B)**：音质上限（**已实现，第二后端，可选项**）。原生流式能力 + 3s 音色克隆 + 方言，中文第一梯队；本机 RTX 2070S fp32 下 RTF≈1.2 撑不起实时流式（块间饿死），**播放改整句非流式（`stream=False`，句内无缝）**；代价是 CPU 慢、需 GPU（实测 ~2.9GB VRAM）、依赖链重（LLM + flow matching + vocoder + CUDA）、句首等待 ~5.6–6.2s（=整句合成耗时）达不到 <1s、**0.5B LLM 生成长度有随机性**（transformers 修复后已基本解决，见下节 ⚠️）。
-- **MOSS-TTS-Nano (0.1B, 2026-04)**：新候选。纯 CPU 原生流式、支持中文 + 音色克隆、有去 PyTorch 的 ONNX 版（~2× 快）；太新、实战验证少，待实测。
+- **MOSS-TTS-Nano (0.1B, 2026-04)**：新候选。纯 CPU 原生流式、支持中文 + 音色克隆、有去 PyTorch 的 ONNX 版（~2× 快）；**2026-08-28 已实测排除——本机 RTF 1.25 非实时**（详见「MOSS-TTS-Nano 探针」节）。
 - **排除**：edge-tts / Azure / 火山等**云端**（需求明确要求离线）；纯自回归音频大模型（GPT-4o audio 类，端到端普遍 >1s）。
 
-**实施顺序**：MeloTTS 已实现并跑通测量；CosyVoice2 已实现为第二后端（详见下节 + `docs/README-cosyvoice2.md`）。下一步候选 MOSS-TTS-Nano 待实测。
+**实施顺序**：MeloTTS 已实现并跑通测量；CosyVoice2 已实现为第二后端（详见下节 + `docs/README-cosyvoice2.md`）。MOSS-TTS-Nano 已实测排除（见下节），当前**无待办候选，维持现状**（melo 实时主力 + cosy 音质/克隆可选项）。
 
 ## CosyVoice2 第二后端（2026-08-26 完成，阶段2 目录重构 + 原生流式后端）
 
@@ -35,6 +35,20 @@
 - **⚠️ transformers 版本坑（2026-08-26 修复，本项目最重要的一次排障）**：main env 的 transformers 4.57.6 与 CosyVoice2 不兼容（官方 [issue #1546](https://github.com/FunAudioLLM/CosyVoice/issues/1546)：>4.51.3 即出问题；4.53+ 重写 `Qwen2Model.forward`）→ LLM 产出全错 speech token → **用户实测"一句输入，多次输出、全是杂音、没完没了"**（Whisper 听写为单字重复如"我哭哭哭哭"）。诊断链路：频谱/基频证明是"人声性"噪声而非白噪 → flow/hifigan 在参考音频自身 token/mel 上能还原参考 ✓ → 定位在 LLM 生成的 token → 版本对比锁定 transformers。修复：vendored `transformers 4.51.3 + tokenizers 0.21.1` 于 `.cache/pinned_transformers`（`setup_cosy_pinned.py` 落盘，94M），`tts/cosy/backend.py` import 时注入；melo 用 main env 4.57.6 不受影响。修复后 Whisper(base/small/medium) 听写**内容正确**、生成**有界**。**cosy 与 melo 不能同进程混用**（明确报错不产杂音）。
 - **生成长度（修复后已基本解决）**：接入初期测得的"EOS 不可靠/时长随机/短句必冲上限"（当时 EOS 概率 <2%、rank 200–1500）其实是坏 transformers 的产物。pin 4.51.3 后实测生成有界、时长与文本长度成比例——8 字 → 51~78 token（~1.3-1.9s）、44 字 → 232~264（~5.8-6.6s）、76 字 → 413（~10.3s），都远低于 20×上限；仅保留正常采样随机性（±1.5×）。`max_speech_ratio` 降级为**可选安全阀**。详见 `docs/README-cosyvoice2.md` §8。
 - **句间停顿为何无解（2026-08-26 fp16 探针）**：非流式修复后句内无缝，但句间停顿 ≈ 合成(N+1) − 播放(N) ≈ 音频差（RTF≈1 下串行合成固有代价，软件改不掉）。**fp16 已实测排除**：`CosyVoice2(fp16=True)` RTF=1.215，反而慢于 fp32（≈0.999-1.0）——0.5B LLM 在独立线程、不在 autocast 作用域内，flow/hifigan 太小在 Turing 上 fp16 开销>收益（Whisper-medium 复核内容仍正确，是被速度否的）；flow 已 `n_timesteps=10` 无余量；vLLM（0.5B 太小）/ 双实例流水线（~5.8GB 显存 + 引擎并发改造）收益不值。**结论：接受 cosy 句间停顿，实时主力仍是 melo；cosy 适合整段/逐句预合成。**
+
+## MOSS-TTS-Nano 探针（2026-08-28，已实测排除——非实时后端）
+
+评估「0.1B 纯自回归 Audio Tokenizer + LLM」类 TTS 能否当实时情感/克隆后端（脚本 `tmp/probe_moss_*.py` + 上游 `third_party/MOSS-TTS-Nano`，独立 `moss-probe` 环境，测完已删）。
+
+- **架构**：Cat 音频 tokenizer **16 个 RVQ codebook**，48kHz **立体声**输出，12.5Hz token 流；支持中文 + 3s 音色克隆（voice_clone，`prompt_text` 传 `None` 而非空串）。
+- **实测（RTX 2070S）**：
+  - **全质量（fp32, nq=16）RTF = 1.25** —— 合成慢于实时，**非实时**；显存 777MB。
+  - **fp16 无效**（RTF 1.27，无提速）：0.1B 小模型是顺序 16-codebook 解码（**延迟受限**，非算力受限），Turing 上 fp16 无收益、显存反升到 2043MB。
+  - **nq=8「快速模式」RTF=0.84 但内容全错**：16 codebook 必须全量，砍掉后 Whisper 听写为混杂语言乱码——**快而不对，不可用**。
+  - **流式 TTFA = 0.20s 非常出色**（text layer 边出边播），但流式整体 RTF 1.63-1.70（生成追不上播放、块间饿死）——与 cosy 同类：**RTF>1 的原生流式在本机不可行**，播放必须等整句合成完。
+- **生成机制坑**：贪心解码会锁死在「继续」token 循环 → 撞 `max_new_frames=375` 上限 → 30s 垃圾；**必须用官方采样默认值**（`do_sample=True`，text_temperature=1.0/top_p=1.0/top_k=50，audio_temperature=0.8/top_p=0.95/top_k=25/repetition_penalty=1.2）。采样下 Whisper 5/5 内容正确。
+- **下载坑（可复用到其他预载）**：hf-mirror.com 返回 307 → **相对路径** `/api/resolve-cache/...`，huggingface_hub 0.36.2 会把相对重定向对 huggingface.co 主机解析（被墙）→ `commit_hash=None` → FileMetadataError。绕法：curl 直链下载到本地目录、绕过 hfh 的镜像重定向逻辑。
+- **结论**：**比 cosy 快的克隆后端，但不是 melo 的替代**——RTF>1 撑不起实时，达不到 <1s 硬指标。维持现状。权重仍在 `.cache/moss/`，探针脚本在 `tmp/`（gitignored）；将来若换 RTF<1 的卡、或官方 ONNX 版（~2×）成熟，可复测。
 
 ## 插桩/验收约定（本项目强约定）
 

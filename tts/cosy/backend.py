@@ -69,6 +69,9 @@ from ..core.backend import BackendNotInstalledError, TTSBackend  # noqa: E402
 # 权重缓存/镜像：与 tts/melo/backend.py 同套 env 前置
 os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_DIR, ".cache", "hf"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+# modelscope 缓存（wetext 文本前端 FST 走这里）默认落在 ~/.cache/modelscope，
+# 同样收进项目内 .cache/ —— 与 HF_HOME 同规矩：所有下载资源都归项目管。
+os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(_PROJECT_DIR, ".cache", "modelscope"))
 
 # CosyVoice 仓库与其 Matcha-TTS 子模块（PYTHONPATH 注入，须在 import cosyvoice 之前）
 _THIRD_PARTY = os.path.join(_PROJECT_DIR, "third_party", "CosyVoice")
@@ -103,7 +106,11 @@ def _ensure_wetext_local():
     若本地已有 FST 缓存，直接把它当 repo_dir 注入，零联网。首次无缓存则维持原逻辑下载。"""
     import wetext.wetext as _w
     local = None
-    root = os.path.join(os.path.expanduser("~"), ".cache", "modelscope", "models")
+    # 与下载落点一致（模块顶层已把 MODELSCOPE_CACHE 重定向到项目 .cache/modelscope），
+    # 不再写死主目录 ~/.cache/modelscope。
+    root = os.path.join(
+        os.environ.get("MODELSCOPE_CACHE", os.path.expanduser("~/.cache/modelscope")),
+        "models")
     if os.path.isdir(root):
         for name in sorted(os.listdir(root)):
             if not name.startswith("pengzhendong--wetext"):

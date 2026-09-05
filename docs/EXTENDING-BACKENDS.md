@@ -1,12 +1,12 @@
 # 扩展新后端指南（melo / cosy 之外）
 
-> 面向「将来接入第三个 TTS 后端」（如 MOSS-TTS-Nano、GPT-SoVITS、edge-tts 等）的
+> 面向「将来接入第三个 TTS 后端」（如 GPT-SoVITS、edge-tts 等）的
 > **实操步骤手册**。回答三个问题：后端长什么样、引擎怎么调它、新后端要改哪几处。
 >
 > 关联文档（动手前按需精读）：
 > - `README.md`「常驻引擎 v2」（§1-§8）= 引擎完整设计，**引擎语义以它为准**。
 > - `docs/README-cosyvoice2.md` = cosy 接入的最全参考实现（含上游补丁）。
-> - `docs/tts-architecture-decision.md` = 选型背景（为什么是 melo + cosy）。
+> - `docs/tts-architecture-decision.md` = 选型背景（为什么是 melo + cosy）；**「MOSS-TTS-Nano 探针」节 = 一个已实测排除的候选**（RTF 1.25 非实时、fp16/nq=8 无效、流式饿死），写新后端前先看，省得重复踩。
 
 ---
 
@@ -191,7 +191,11 @@ def synth(self, text, *, speed=1.0, normalize=None):
 os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_DIR, ".cache", "hf"))     # 权重缓存落项目内
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")                    # huggingface.co 被墙
 os.environ.setdefault("NLTK_DATA", os.path.join(_PROJECT_DIR, ".cache", "nltk_data"))  # 需要 g2p 语料时
+os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(_PROJECT_DIR, ".cache", "modelscope"))  # 走 modelscope 通道的资源（如 wetext FST）
 ```
+> **铁律：所有下载资源必须重定向进项目 `.cache/`**，绝不落主目录（`~/.cache/...`）。cosy 曾漏了
+> modelscope 的 wetext FST（落 `~/.cache/modelscope`），已修。新后端凡有下载，先在模块顶层列全
+> env 前置并核对落点。
 
 **transformers pin（仅 cosy 需要）**：cosy 因上游 issue #1546 必须 `transformers==4.51.3`，
 用 `setup_cosy_pinned.py` 落盘 vendored 副本 + 模块顶层注入 `sys.path`。**新后端若对 transformers

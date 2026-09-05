@@ -11,7 +11,7 @@
 
 详细安装步骤**以 README 为准**，CLAUDE.md 只给地图：
 
-1. **环境**：见 `README.md`「从零复现步骤（新设备推荐，可整段复制）」——从零建 `voice-tts` conda 环境（Python 3.10 + torch 2.11.0+cu126），版本锁定表在「已锁定版本」。cosy 的安装另见 `docs/README-cosyvoice2.md` §2。
+1. **环境**：见 `README.md`「从零复现步骤（新设备推荐，可整段复制）」——从零建 `voice-tts` conda 环境（Python 3.10 + torch 2.11.0+cu126），版本锁定表在「已锁定版本」。cosy 的安装另见 `docs/README-cosyvoice2.md` §2。**若本地已有 `voice-asr` 环境（voice1 项目，<https://github.com/celestezj/voice1>），直接用它跑 voice0，无需重复安装**——两者同一底座（Python 3.10 + torch 2.11.0+cu126），voice-asr 已含 voice0 全部依赖（melo 为 editable 装自 `.cache/MeloTTS`）；**已有 voice-asr 就直接用，缺失的依赖直接 `pip install` 装进该环境即可，不必新建 voice-tts**。
 2. **权重预下载**（仅首次联网，之后运行期零网络）：
    - melo：`python preload_weights.py`
    - cosy（若用）：`python preload_cosy.py` + `python setup_cosy_pinned.py`（落盘 cosy 专属 transformers 4.51.3）
@@ -27,7 +27,7 @@
 
 ## 环境硬性约束（新 Claude Code 接手必须先知道）
 
-- **Python 必须用 `voice-tts` conda 环境**：先 `conda activate voice-tts` 再跑 `python`；base Python 3.12 无 torch。新设备按 README 重建同名环境。
+- **Python 必须用 TTS 专用环境：`voice-asr`（优先，voice1 项目已有则共用）/ `voice-tts`（fallback）**：先 `conda activate voice-asr`（或 voice-tts）再跑 `python`；base Python 3.12 无 torch。新设备按 README 重建同名环境。
 - **跑带中文输出的命令加 `PYTHONIOENCODING=utf-8`**：Windows 默认 GBK 会直接崩。
 - 权重/缓存重定向到项目内 `.cache/`（`HF_HOME`/`HF_ENDPOINT` 在模块里已设好）；首次下载走 `HF_ENDPOINT=https://hf-mirror.com` 镜像（huggingface.co 直连被墙）。
 - git 仓库根即本目录（`third_party/` 是 gitignored 的上游 clone，别在里面提交）。
